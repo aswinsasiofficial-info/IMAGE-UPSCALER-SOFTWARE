@@ -1,0 +1,12 @@
+# Batch Image Upscaler — dependencies
+#
+# The CUDA build of PyTorch lives on PyTorch's own index, so we point pip at it
+# with --extra-index-url. This makes `pip install -r requirements.txt` work in
+# one shot on an NVIDIA machine (RTX 3050 / CUDA 12.x).
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+torch==2.14.1+cu126
+torchvision==0.29.1+cu126
+PySide6>=6.8
+Pillow>=10.0
+numpy>=1.26
