@@ -10,7 +10,6 @@ from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -173,23 +172,6 @@ class MainWindow(QMainWindow):
         tile_row.addWidget(QLabel("0 = auto"))
         form.addLayout(tile_row)
 
-        # Output scale (network is 4x; result is resampled to this target)
-        scale_row = QHBoxLayout()
-        scale_row.addWidget(QLabel("Output scale:"))
-        self.scale_spin = QDoubleSpinBox()
-        self.scale_spin.setRange(1.0, 16.0)
-        self.scale_spin.setSingleStep(0.5)
-        self.scale_spin.setDecimals(2)
-        self.scale_spin.setSuffix("x")
-        self.scale_spin.setValue(5.0)
-        self.scale_spin.setToolTip(
-            "Final size = original x this value.\n"
-            "The AI runs at its native 4x; the result is then resampled "
-            "(Lanczos) to the chosen scale. 4x = pure neural.")
-        self.scale_spin.valueChanged.connect(self._on_scale_changed)
-        scale_row.addWidget(self.scale_spin, 1)
-        form.addLayout(scale_row)
-
         # Format
         fmt_row = QHBoxLayout()
         fmt_row.addWidget(QLabel("Format:"))
@@ -208,11 +190,10 @@ class MainWindow(QMainWindow):
         suf_row = QHBoxLayout()
         suf_row.addWidget(QLabel("Filename suffix:"))
         self.suffix_edit = QLineEdit()
-        self.suffix_edit.setText("_5x")
+        self.suffix_edit.setText("_x4")
         suf_row.addWidget(self.suffix_edit, 1)
         form.addLayout(suf_row)
         self._on_format_changed(self.format_combo.currentText())
-        self._on_scale_changed(self.scale_spin.value())
 
         form.addStretch(1)
         return box
@@ -248,10 +229,6 @@ class MainWindow(QMainWindow):
     # -- helpers --------------------------------------------------------------
     def _on_format_changed(self, fmt: str) -> None:
         self.quality_spin.setEnabled(fmt == "jpg")
-
-    def _on_scale_changed(self, val: float) -> None:
-        # Keep the filename suffix in sync with the chosen scale (e.g. _4x, _5x).
-        self.suffix_edit.setText(f"_{val:g}x")
 
     def _refresh_model_hint(self) -> None:
         weights = DEFAULT_MODEL_DIR / MODEL_FILENAME
@@ -324,7 +301,6 @@ class MainWindow(QMainWindow):
             fp16=self.chk_fp16.isChecked(),
             tile=self.tile_spin.value(),
             tile_pad=16,
-            output_scale=float(self.scale_spin.value()),
             output_format=self.format_combo.currentText(),
             jpg_quality=self.quality_spin.value(),
             filename_suffix=self.suffix_edit.text(),
@@ -380,8 +356,7 @@ class MainWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         self.start_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
-        for w in (self.device_combo, self.chk_fp16, self.tile_spin, self.scale_spin,
-                  self.format_combo,
+        for w in (self.device_combo, self.chk_fp16, self.tile_spin, self.format_combo,
                   self.quality_spin, self.chk_same_dir, self.out_edit, self.suffix_edit):
             w.setEnabled(not running)
         if running:

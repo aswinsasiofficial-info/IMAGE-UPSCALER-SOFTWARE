@@ -49,7 +49,6 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA exists")
     parser.add_argument("--tile", type=int, default=64, help="Tile size (default small for test)")
-    parser.add_argument("--scale", type=float, default=4.0, help="Output scale (network is 4x; others resampled)")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -61,7 +60,6 @@ def main() -> int:
             fp16=False if args.cpu else True,
             tile=args.tile,
             tile_pad=8,
-            output_scale=args.scale,
             output_format="png",
         )
         up = RealESRGANUpscaler(settings)
@@ -75,7 +73,7 @@ def main() -> int:
             with Image.open(dst) as im:
                 out_size, out_mode = im.size, im.mode
             with Image.open(src) as in_im:
-                expected = (round(in_im.width * args.scale), round(in_im.height * args.scale))
+                expected = (in_im.width * 4, in_im.height * 4)
                 in_mode = in_im.mode
             ok = out_size == expected and out_mode == in_mode
             print(f"  -> {dst.name}: {out_size} mode={out_mode} "
@@ -85,7 +83,7 @@ def main() -> int:
         if failures:
             print(f"\nSMOKE TEST FAILED: {failures} mismatched output(s).")
             return 1
-        print(f"\nSMOKE TEST PASSED: all outputs are {args.scale:g}x with correct mode.")
+        print("\nSMOKE TEST PASSED: all outputs are 4x with correct mode.")
         return 0
 
 

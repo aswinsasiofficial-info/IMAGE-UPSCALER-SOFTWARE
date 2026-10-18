@@ -15,8 +15,6 @@ after the model weights are downloaded once.
   recursively). The model is loaded **once** and reused for every image.
 - **Real-ESRGAN x4plus** — high-quality 4× super-resolution for photos,
   screenshots, artwork and anime-style images.
-- **Adjustable output scale (2×–8×)** — pick any final size (e.g. **5×**); the
-  AI runs at its native 4× and the result is resampled (Lanczos) to your target.
 - **CUDA + fp16** — runs on the GPU in half precision for speed and lower VRAM.
 - **VRAM-safe tiling** — large images are automatically split into overlapping
   tiles so they fit in 6 GB of VRAM (no out-of-memory crashes on big photos).
@@ -92,21 +90,6 @@ and shows download progress in the status bar.
 - **More VRAM / faster:** `384`–`512` on 8-12 GB cards.
 - **`tile = 0`:** process the whole image in one pass — only safe for small
   inputs; disables tiling.
-
-### Output scale (e.g. 5×)
-
-The `RealESRGAN_x4plus` network is **fixed at 4×** — there is no 5× neural model.
-The **Output scale** setting controls the final pixel dimensions:
-
-- The AI always generates a **4×** result (all the neural detail).
-- That result is then **resampled with Lanczos** to `original × output_scale`.
-- **4×** = pure neural output (no resample). **5×, 6×, 8×…** = 4× neural,
-  gently enlarged (bigger canvas, but no *extra* AI detail beyond 4×).
-- **2×/3×** are actually *sharper* than a native low-scale model, because we
-  downscale from the larger 4× AI result.
-
-The default is **5×** (suffix `_5x`). Change it from the **Output scale** field;
-the filename suffix updates automatically.
 
 ## Verify the engine (optional, no GUI)
 

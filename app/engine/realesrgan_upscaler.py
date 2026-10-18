@@ -50,10 +50,9 @@ class UpscaleSettings:
     fp16: bool = True             # half precision (big speed/VRAM win on RTX 30xx)
     tile: int = 256               # input tile size in px; 0 = no tiling (whole image)
     tile_pad: int = 16            # overlap between tiles (hides seams)
-    output_scale: float = 4.0     # final size = src * output_scale (network is 4x; resampled to target)
     output_format: str = "png"    # "png" | "jpg"
     jpg_quality: int = 95
-    filename_suffix: str = "_4x"
+    filename_suffix: str = "_x4"
     keep_original_name: bool = True
     output_in_source_dir: bool = False  # True: write next to each source; False: use chosen folder
 
@@ -213,18 +212,6 @@ class RealESRGANUpscaler:
         rgba = np.dstack([rgb_uint8, a])
         return rgba
 
-    @staticmethod
-    def _resize_rgb(rgb_uint8: np.ndarray, w: int, h: int) -> np.ndarray:
-        """Resample the native 4x result to the requested output size.
-
-        Uses Lanczos for both up- and down-scaling; when the target already
-        matches the 4x dimensions this is a no-op (fast path, no softening).
-        """
-        if (rgb_uint8.shape[1], rgb_uint8.shape[0]) == (w, h):
-            return rgb_uint8
-        img = Image.fromarray(rgb_uint8).resize((w, h), Image.Resampling.LANCZOS)
-        return np.asarray(img, dtype=np.uint8)
-
     def _save(self, array_hwc: np.ndarray, out_path: Path) -> None:
         img = Image.fromarray(array_hwc)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,20 +291,14 @@ class RealESRGANUpscaler:
         src_h, src_w = arr.shape[:2]
         tensor = torch.from_numpy(arr.copy()).permute(2, 0, 1).unsqueeze(0).contiguous()
 
-        out = self._infer_tensor(tensor)          # (1,3,src*4) float32 [0,1] — native 4x
+        out = self._infer_tensor(tensor)          # (1,3,out_h,out_w) float32 [0,1]
         out = torch.clamp(out, 0.0, 1.0)
-        rgb4x = (out.squeeze(0).permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
-
-        # Resample the 4x neural result to the requested output scale.
-        target_w = max(1, round(src_w * self.settings.output_scale))
-        target_h = max(1, round(src_h * self.settings.output_scale))
-        rgb = self._resize_rgb(rgb4x, target_w, target_h)
-        rgb = self._merge_alpha(rgb, alpha)
-        self._save(rgb, out_path)
+        out_np = (out.squeeze(0).permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+        out_np = self._merge_alpha(out_np, alpha)
+        self._save(out_np, out_path)
 
         if log:
-            log(f"[OK] {in_path.name}: {src_w}x{src_h} -> {target_w}x{target_h} "
-                f"({self.settings.output_scale:g}x)")
+            log(f"[OK] {in_path.name}: {src_w}x{src_h} -> {out_np.shape[1]}x{out_np.shape[0]}")
         return out_path
 
     def cleanup(self) -> None:
