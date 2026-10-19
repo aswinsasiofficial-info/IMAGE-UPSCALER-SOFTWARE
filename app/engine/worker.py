@@ -16,15 +16,33 @@ from .realesrgan_upscaler import RealESRGANUpscaler, UpscaleSettings
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
+# Outputs of "folder mode" live in this subfolder of each selected folder; it is
+# always skipped when scanning so re-runs never re-process generated images.
+UPSCALED_DIR_NAME = "upscaled"
+
+
+def _under_output_dir(child: Path, root: Path) -> bool:
+    """True if ``child`` lives inside ``root/upscaled`` (a previous folder output)."""
+    try:
+        rel = child.relative_to(root)
+    except ValueError:
+        return False
+    return len(rel.parts) > 1 and rel.parts[0].lower() == UPSCALED_DIR_NAME
+
 
 def collect_images(paths: list[Path]) -> list[Path]:
-    """Expand a mix of files/folders into a de-duplicated, sorted image list."""
+    """Expand a mix of files/folders into a de-duplicated, sorted image list.
+
+    Folder scans are recursive but skip the folder's own ``upscaled`` output
+    subfolder so previously generated results are never picked up again.
+    """
     found: list[Path] = []
     for p in paths:
         p = Path(p)
         if p.is_dir():
             for child in sorted(p.rglob("*")):
-                if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS:
+                if (child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS
+                        and not _under_output_dir(child, p)):
                     found.append(child)
         elif p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
             found.append(p)
@@ -55,16 +73,50 @@ class BatchWorker(QThread):
     finished_all = Signal(int, int)                 # (succeeded, failed)
     cancelled = Signal()
 
-    def __init__(self, files: list[Path], out_dir: Path, settings: UpscaleSettings) -> None:
+    def __init__(self, files: list[Path], out_dir: Path, settings: UpscaleSettings,
+                 folder_roots: list[Path] | None = None) -> None:
         super().__init__()
         self.files = files
         self.out_dir = Path(out_dir)
         self.settings = settings
+        # Roots selected via "Add Folder": their images save to <root>/upscaled/.
+        self.folder_roots = [Path(r).resolve() for r in (folder_roots or [])]
         self._cancel = False
         self._upscaler: RealESRGANUpscaler | None = None
 
     def request_cancel(self) -> None:
         self._cancel = True
+
+    def _matching_root(self, src: Path) -> tuple[Path, Path] | None:
+        """Return (root, parent dir relative to root) if *src* came from a folder root."""
+        try:
+            resolved = src.resolve()
+        except OSError:
+            return None
+        best: tuple[Path, Path] | None = None
+        for root in self.folder_roots:
+            try:
+                rel = resolved.relative_to(root)
+            except ValueError:
+                continue
+            # Deepest matching root wins when folders were added nested.
+            if best is None or len(root.parts) > len(best[0].parts):
+                best = (root, rel.parent)
+        return best
+
+    def output_base_dir(self, src: Path) -> Path:
+        """Directory a result for *src* should be written to.
+
+        Folder mode takes precedence: images under a selected folder go to
+        ``<folder>/upscaled/<same relative subfolder>`` so identically named
+        files from different subfolders never collide. Everything else keeps
+        the classic behaviour (beside the original, or the global output dir).
+        """
+        match = self._matching_root(src)
+        if match is not None:
+            root, rel_parent = match
+            return root / UPSCALED_DIR_NAME / rel_parent
+        return src.parent if self.settings.output_in_source_dir else self.out_dir
 
     def run(self) -> None:  # noqa: D102 (QThread entry point)
         total = len(self.files)
@@ -72,6 +124,11 @@ class BatchWorker(QThread):
         try:
             if not self.settings.output_in_source_dir:
                 self.out_dir.mkdir(parents=True, exist_ok=True)
+            if self.folder_roots:
+                roots = ", ".join(str(r) for r in self.folder_roots)
+                self.log_message.emit(
+                    f"Folder mode: each selected folder saves its results inside its "
+                    f"'{UPSCALED_DIR_NAME}' subfolder (structure preserved): {roots}")
             self._upscaler = RealESRGANUpscaler(self.settings)
             self.log_message.emit("Loading model…")
             self._upscaler.load(
@@ -90,7 +147,7 @@ class BatchWorker(QThread):
                 break
             self.image_started.emit(src.name)
             try:
-                base_dir = src.parent if self.settings.output_in_source_dir else self.out_dir
+                base_dir = self.output_base_dir(src)
                 out_path = resolve_output_path(src, base_dir, self.settings)
                 out_path = self._avoid_collision(out_path)
                 self._upscaler.upscale_image(src, out_path, log=self.log_message.emit)

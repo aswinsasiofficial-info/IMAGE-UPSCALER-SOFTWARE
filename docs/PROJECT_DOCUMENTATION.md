@@ -1,17 +1,20 @@
 # Batch Image Upscaler — Comprehensive Project Documentation
 
-**Version:** 1.1 · **Model:** Real-ESRGAN `x4plus` · **Stack:** Python 3.10+, PyTorch (CUDA 12.6), PySide6 (Qt 6)
+**Version:** 1.3 · **Model:** Real-ESRGAN `x4plus` · **Stack:** Python 3.10+, PyTorch (CUDA 12.6), PySide6 (Qt 6)
 
 A fully local, GPU-accelerated Windows desktop application that batch-upscales images **4×**
 using the **Real-ESRGAN x4plus** super-resolution model. It is tuned to run on an
 **NVIDIA RTX 3050 (6 GB VRAM)** with 16 GB system RAM, processes 20–30+ images per batch,
 and requires **no internet connection after the one-time model-weight download**.
+Every saved output is **exactly 8000 × 5000 px by default** (configurable), reached by a
+crop-to-fill resize that never stretches the image.
 
 > **Note on resampling:** the neural network's internal upsampling uses
 > **nearest-neighbor** (feature-space) and the alpha-channel resize uses
 > **bicubic** — neither uses Lanczos. A **Lanczos (LANCZOS)** filter is used in
-> exactly one place: the optional **final downscale** that fits the finished 4×
-> image within the configurable maximum dimensions (default **8000 × 5000**).
+> exactly one place: the final **crop-to-fill resize** that makes the finished 4×
+> image *exactly* cover the configured target dimensions (default **8000 × 5000**)
+> before a centered crop trims the excess.
 > See [Section 6 — Resampling Logic](#6-resampling-in-this-project) for details
 > and rationale.
 
@@ -76,8 +79,8 @@ Key design decisions:
 
 Data flow for one image: file path → EXIF-aware PIL load → RGB float32 NumPy array in `[0,1]`
 (+ optional detached alpha channel) → `(1,3,H,W)` tensor → device/fp16 → RRDBNet forward pass
-(whole or tiled) → clamp to `[0,1]` → uint8 → alpha re-merge → Lanczos downscale to fit the
-configured `max_width`×`max_height` → PNG/JPEG save.
+(whole or tiled) → clamp to `[0,1]` → uint8 → alpha re-merge → Lanczos crop-to-fill resize to
+the exact `target_width`×`target_height` (default 8000×5000) → centered crop → PNG/JPEG save.
 
 ---
 
@@ -98,7 +101,8 @@ d:\Upscaler\
 ├── tests/
 │   ├── smoke_test.py                # headless end-to-end engine check
 │   ├── worker_batch_test.py         # BatchWorker path test (offscreen Qt)
-│   └── max_size_test.py             # max-output-size + transparency resize test
+│   ├── target_size_test.py          # exact-target crop-to-fill + transparency test
+│   └── folder_mode_test.py          # folder-mode scan/output-path test (no model)
 ├── setup.ps1                        # one-time environment installer
 ├── run.bat                          # double-click launcher
 ├── run.ps1                          # PowerShell launcher
@@ -148,9 +152,10 @@ Constants: `MODEL_URL` (official GitHub release), `MODEL_FILENAME`,
 
 - **`UpscaleSettings`** (dataclass) — all tunable knobs surfaced by the GUI: `device`,
   `fp16`, `tile`, `tile_pad`, `output_format`, `jpg_quality`, `filename_suffix`,
-  `keep_original_name`, `output_in_source_dir`, `max_width` (default 8000) and
-  `max_height` (default 5000) — the bounds the finished 4× image is downscaled to fit
-  within (`0` disables a axis). Includes
+  `keep_original_name`, `output_in_source_dir`, `target_width` (default 8000) and
+  `target_height` (default 5000) — the **exact** dimensions every saved image gets
+  via crop-to-fill (`0` on either axis disables the operation and keeps the raw 4×
+  size). Includes
   `recommended_tile_for_vram()` — a stepped heuristic mapping VRAM tiers
   (≥12 GB → 512, ≥8 → 384, ≥6 → 256, ≥4 → 192, else 128) to safe tile sizes.
 - **`ensure_weights()`** — idempotent weight acquisition: returns the cached file if
@@ -169,33 +174,52 @@ Constants: `MODEL_URL` (official GitHub release), `MODEL_FILENAME`,
     float32 NumPy in `[0,1]` plus the raw alpha `Image`.
   - `_merge_alpha()` — resizes the alpha channel to output dimensions with
     **bicubic** resampling and re-stacks it onto the upscaled RGB (see Section 6).
-  - `compute_fit_dimensions()` / `_fit_to_max()` — the **final resize**: computes the
-    largest size fitting inside `max_width`×`max_height` (aspect preserved, never
-    enlarged) and downscales the composited image with **Lanczos** (see Section 6.3).
+  - `compute_fill_dimensions()` / `_fill_to_target()` — the **final crop-to-fill
+    resize**: computes the smallest cover size `max(tw/w, th/h)` (aspect preserved,
+    enlargement allowed), resizes with **Lanczos**, then takes a centered crop of
+    exactly `target_width`×`target_height` (see Section 6.3). Returns
+    `(array, was_cropped)` for logging.
   - `_tile_inference()` — overlapping-tile inference (see Section 7).
   - `_infer_tensor()` — wrapped in `@torch.inference_mode`; bypasses tiling when
     `tile == 0` or the image already fits within one tile.
   - `upscale_image()` — the full per-file pipeline; clamps output to `[0,1]`,
-    converts to uint8, merges alpha, downscales to the configured maximum size
-    (if it exceeds the bounds), saves, and logs the **final saved dimensions**
-    (e.g. `5000x2500 -> 20000x10000 -> resized 8000x4000`).
+    converts to uint8, merges alpha, crop-to-fills to the exact target size,
+    saves, and logs the **exact saved dimensions**, calling out when a centered
+    crop occurred (e.g. `2000x1250 -> 8000x5000 -> center-cropped to exact target 8000x5000`).
   - `cleanup()` — releases the model and calls `torch.cuda.empty_cache()`.
 
 ### 3.4 `app/engine/worker.py` — Batch Orchestration
 
 - `IMAGE_EXTENSIONS` = `.jpg .jpeg .png .bmp .tif .tiff .webp`.
+- `UPSCALED_DIR_NAME` = `"upscaled"` — the per-folder output subfolder used by
+  **folder mode**; folder scans always skip it so generated results are never
+  re-processed on a later run.
 - **`collect_images()`** — expands a mix of files and folders (recursive `rglob`)
-  into a de-duplicated, order-preserving image list, filtering by extension.
+  into a de-duplicated, order-preserving image list, filtering by extension and
+  excluding anything inside the scanned folder's own `upscaled` subfolder
+  (case-insensitive top-level match via `_under_output_dir()`).
 - **`resolve_output_path()`** — builds `"{stem}{suffix}{ext}"` in the output dir.
 - **`BatchWorker(QThread)`** — signals: `log_message`, `progress(done,total)`,
   `image_started`, `image_done`, `image_failed`, `download_progress`,
-  `finished_all(ok,failed)`, `cancelled`. Its `run()` method:
+  `finished_all(ok,failed)`, `cancelled`. Constructor additionally accepts
+  `folder_roots` (the folders the user picked with *Add Folder…*, or dropped
+  onto the window). Its `run()` method:
   1. Creates the output dir, constructs the upscaler, **loads the model once**.
   2. Loops over the queue, checking the cooperative `_cancel` flag **between images**.
-  3. Per image: resolves output path, avoids collisions (`_avoid_collision()` appends
-     `(1)`, `(2)`, … — never silently overwrites), upscales, emits signals.
+  3. Per image: resolves the output directory via `output_base_dir()`, then the
+     output path; avoids collisions (`_avoid_collision()` appends `(1)`, `(2)`, … —
+     never silently overwrites); upscales, emits signals.
   4. On any per-image exception: counts it as failed, logs, and **continues the batch**.
   5. Calls `cleanup()` and emits `finished_all`.
+
+  **`output_base_dir()`** implements the folder-mode precedence: if the source
+  lives under a remembered folder root (deepest matching root wins for nested
+  selections), the result is written to `<root>/upscaled/<same relative
+  subfolder>` — e.g. `photos/trip/image.jpg` → `<root>/upscaled/photos/trip/image_x4.jpg`
+  — so identically named files from different subfolders never collide. Images
+  that did not come from a folder selection keep the classic behaviour (beside
+  the original when `output_in_source_dir` is set, otherwise the global output
+  folder). Output directories are auto-created by the engine's `_save()`.
 
   A setup failure (e.g. weights unreachable) aborts the whole batch early with
   `finished_all(0, total)`.
@@ -299,9 +323,11 @@ image — verified by `tests/worker_batch_test.py`, which asserts the
    whole-image if it fits one tile, otherwise tiled (Section 7).
 5. Result → float32 → `torch.clamp(0,1)` → uint8.
 6. Alpha resized to output size with bicubic and re-stacked (RGBA preserved in PNG).
-7. **Final max-size resize:** if the composited image exceeds `max_width`×`max_height`
-   (default 8000×5000) it is downscaled with **Lanczos** to fit inside those bounds,
-   preserving aspect ratio (never enlarged; `0×0` disables) — see Section 6.3.
+7. **Final crop-to-fill resize:** the composited image is resized with **Lanczos**
+   to *cover* the exact `target_width`×`target_height` (default **8000×5000**) using
+   scale `max(tw/w, th/h)` — enlarging small 4× results if needed, never stretching —
+   then a centered crop trims the excess so the output is *exactly* the target size
+   (target `0` disables; see Section 6.3).
 8. Saved as PNG (lossless, alpha-capable) or JPEG at the chosen quality
    (alpha flattened onto white, since JPEG cannot store transparency).
 
@@ -319,8 +345,8 @@ into `models/` from the [official release] — the app will detect and reuse it.
 A common assumption for upscaling tools is Lanczos resampling. Inside the **neural
 network** there is still **no Lanczos** — the two upsampling mechanisms actually used
 by the model are nearest-neighbor (feature space) and bicubic (alpha channel). Lanczos
-appears only in the separate, optional **final downscale** that caps the output size
-(Section 6.3).
+appears only in the separate **final crop-to-fill resize** that pins the output to the
+exact target size (Section 6.3).
 
 ### 6.1 Nearest-neighbor — inside the network (`rrdbnet.py`)
 
@@ -364,27 +390,30 @@ steps 4–5) is what provides photo realism; a Lanczos resize (e.g.,
 `Image.resize(..., Image.Resampling.LANCZOS)`) would only be a non-AI classical
 alternative, strictly lower quality at 4× for photographic content.
 
-### 6.3 Lanczos — final downscale to the configured maximum (`realesrgan_upscaler.py`)
+### 6.3 Lanczos — final crop-to-fill resize to the exact target (`realesrgan_upscaler.py`)
 
 Because the model always runs at 4×, a large source (e.g. 5000×2500) produces a
-20000×10000 result. After inference and alpha re-merge, `_fit_to_max()` optionally
-shrinks the finished image so it **fits within** the configured `max_width` ×
-`max_height` bounds (default **8000 × 5000**), preserving the aspect ratio (no crop,
-no stretch). The scale is `min(max_w/w, max_h/h, 1)`, so a 20000×10000 result becomes
-8000×4000 and an image already inside the bounds is left untouched (never enlarged).
+20000×10000 result. After inference and alpha re-merge, `_fill_to_target()` resizes the
+finished image so it **fully covers** the configured `target_width` × `target_height`
+(default **8000 × 5000**), then takes a **centered crop** of exactly that size. The
+scale is `max(target_w/w, target_h/h)` — a single uniform factor, so the aspect ratio
+is preserved and the image is **never stretched**; a 4× result *smaller* than the
+target is enlarged as needed to fill it. A 20000×10000 result becomes 10000×5000 and
+is then center-cropped to 8000×5000; a result with the exact 8:5 ratio maps 1:1 with
+no crop at all.
 
 ```python
-img = Image.fromarray(array_hwc).resize((new_w, new_h), Image.Resampling.LANCZOS)
+img = img.resize((fill_w, fill_h), Image.Resampling.LANCZOS)
+img = img.crop((left, top, left + target_w, top + target_h))  # centered
 ```
 
-This is a **downscale**, which is precisely where Lanczos shines: it is an
-anti-aliasing kernel that preserves perceived sharpness while suppressing the moiré
-and aliasing that nearest/bilinear would introduce when throwing pixels away. It runs
-on the fully composited RGB/RGBA array, so **PNG transparency is preserved** and the
-existing JPEG behaviour (flatten onto white) is unchanged. Setting either bound to `0`
-disables the cap on that axis (`0 × 0` disables the resize entirely). Crucially, this
-filter acts only on the final output — the network's internal nearest/bicubic
-resampling (Sections 6.1–6.2) is untouched.
+Lanczos is the high-quality choice for this resize in both directions: when throwing
+pixels away it acts as an anti-aliasing kernel suppressing moiré, and when enlarging
+it stays sharper than bilinear/bicubic. It runs on the fully composited RGB/RGBA
+array, so **PNG transparency is preserved** and the existing JPEG behaviour (flatten
+onto white) is unchanged. Setting either target to `0` disables crop-to-fill entirely
+(the raw 4× size is saved). Crucially, this filter acts only on the final output — the
+network's internal nearest/bicubic resampling (Sections 6.1–6.2) is untouched.
 
 ### 6.4 Summary table
 
@@ -392,7 +421,7 @@ resampling (Sections 6.1–6.2) is untouched.
 |---|---|---|---|
 | `RRDBNet` upsample stages | **nearest-neighbor** + learned convs | 64-ch feature tensor | Matches training; the conv layers learn the reconstruction — Lanczos would ring and mismatch weights |
 | Alpha channel resize | **bicubic** (`Image.Resampling.BICUBIC`) | 8-bit mask plane | Smooth, monotone, no overshoot halos at transparency edges (Lanczos overshoot risk) |
-| Final max-size downscale | **Lanczos** (`Image.Resampling.LANCZOS`) | RGB/RGBA output image | High-quality *downscale* to fit `max_width`×`max_height`; anti-aliases, preserves aspect ratio and PNG alpha |
+| Final crop-to-fill resize | **Lanczos** (`Image.Resampling.LANCZOS`) | RGB/RGBA output image | High-quality *uniform-scale* resize to cover `target_width`×`target_height`, then centered crop; keeps aspect ratio and PNG alpha, never stretches |
 | JPEG/PNG encoding | none (lossless pixel write / DCT encode) | uint8 image | Resampling already done; no further resize occurs |
 
 ---
@@ -434,7 +463,7 @@ Built with **PySide6** (`QMainWindow`, 940×620 default, Fusion style). Layout:
 │  • [Add Images…] [Add        │  • Device: Auto/CUDA/CPU      │
 │    Folder…] [Remove Sel.]    │  • ☑ Half precision (fp16)    │
 │    [Clear]                   │  • Tile size spin (0–1024)    │
-│                              │  • Max output 8000 × 5000     │
+│                              │  • Target size 8000 × 5000    │
 │                              │  • Format png/jpg + quality   │
 │                              │  • Filename suffix (_x4)      │
 ├──────────────────────────────┴───────────────────────────────┤
@@ -452,7 +481,16 @@ Behavior highlights:
   defaults to *CUDA (GPU)*, fp16 is pre-checked, and tile size is pre-set from
   `recommended_tile_for_vram()`; otherwise a ⚠ CPU-fallback warning shows in the status bar.
 - **Drag & drop:** the window accepts URL drops; folders in a drop are expanded
-  recursively through `collect_images()`. Duplicates are ignored (case-insensitive).
+  recursively through `collect_images()` and are remembered as folder-mode roots,
+  exactly like *Add Folder…*. Duplicates are ignored (case-insensitive).
+- **Folder mode:** *Add Folder…* reuses the existing toolbar/button action — no
+  separate button. It scans the folder recursively (skipping the folder's own
+  `upscaled` subfolder), queues every supported image and logs that results will
+  be saved under `<folder>/upscaled/` with subfolders preserved. An empty (or
+  images-only-in-`upscaled`) folder shows a clear "No images found" dialog and
+  queues nothing. The Settings panel carries a hint label explaining the
+  `<folder>/upscaled/` destination; individually added images still follow the
+  global Output folder / "Save beside each original" settings.
 - **Model readiness hint:** the log notes at startup whether weights are cached or
   will auto-download.
 - **Reactive controls:** the JPG quality spin enables only for `jpg`; the output-folder
@@ -538,28 +576,40 @@ All three paths use the project's `.venv` and exit with guidance if it's missing
 1. **Add images** — via **Add Images…** (multi-select files), **Add Folder…** (recursive
    scan for supported formats: JPG/JPEG/PNG/BMP/TIFF/WEBP), or **drag & drop** files/folders
    onto the window. The queue count shows in the status label; duplicates are skipped.
+   Folder scans deliberately ignore the folder's existing `upscaled` output subfolder,
+   so a re-run never re-processes previous results. Selecting a folder that contains no
+   supported images shows a clear message and adds nothing to the queue.
 2. **Choose output location** — either browse to an **Output folder** (default suggestion:
-   `~\Upscaled`), or tick **Save beside each original**. Existing files are never
-   overwritten — collisions get `(1)`, `(2)`, … suffixes automatically.
+   `~\Upscaled`), or tick **Save beside each original**. Images added through
+   **Add Folder…** (or dropped as folders) instead always go to
+   **`<selected folder>/upscaled/<same relative subfolder>/<name><suffix>.<ext>`** —
+   e.g. `photos/trip/image.jpg` → `upscaled/photos/trip/image_x4.jpg` — which keeps
+   subfolder structure and prevents name collisions between subfolders. Existing files
+   are never overwritten in any mode — collisions get `(1)`, `(2)`, … suffixes
+   automatically.
 3. **Configure the engine**
    - **Device:** *CUDA (GPU)* (preselected when detected) or *CPU* (much slower).
    - **fp16:** keep checked on NVIDIA GPUs — roughly halves VRAM and speeds up inference.
    - **Tile size:** `256` is the recommended default for a 6 GB RTX 3050; `0` disables
      tiling (small images only). Lower to `192`/`128` if you hit out-of-memory errors.
-   - **Max output size:** width × height caps (default **8000 × 5000**). The 4× result
-     is downscaled with Lanczos to *fit within* these bounds, aspect ratio preserved
-     (no crop/stretch). Already-smaller images are untouched; `0` disables a axis.
+   - **Exact target size:** width × height (default **8000 × 5000**). Every output
+     is resized (Lanczos, uniform scale — never stretched) to *cover* these
+     dimensions and then **center-cropped to exactly** width × height; 4× results
+     smaller than the target are enlarged to fill it. `0` disables crop-to-fill
+     and keeps the raw 4× size. Note that images whose aspect ratio differs from
+     8:5 lose some content at the overspilled edges.
    - **Format:** `png` (lossless, preserves transparency) or `jpg` (+ quality 50–100;
      transparency is flattened onto white).
    - **Filename suffix:** appended to each output name, e.g. `photo_x4.png`.
 4. **Click Start Upscaling.** The model loads once (with a progress readout in the status
    bar on the very first run while weights download), then images process back-to-back.
-   Watch the per-image `[OK] name: WxH -> 4Wx4H` (or `... -> resized WxH` when the
-   max-size cap kicked in) log lines and the progress bar.
+   Watch the per-image `[OK] name: WxH -> 4Wx4H -> center-cropped to exact target
+   8000x5000` log lines (or `... -> resized to exact target ...` when no cropping was
+   needed) and the progress bar.
 5. **Cancel anytime** — the current image finishes, then the batch stops gracefully.
-6. When the completion dialog appears, outputs are in your chosen location — 4× the
-   source, then downscaled to fit within the configured maximum (default 8000×5000),
-   with preserved color mode (RGB stays RGB; RGBA stays RGBA in PNG).
+6. When the completion dialog appears, outputs are in your chosen location — every
+   one of them **exactly** the configured target size (default 8000×5000), with
+   preserved color mode (RGB stays RGB; RGBA stays RGBA in PNG).
 
 **Expected quality:** photos, screenshots, artwork, anime-style content all benefit;
 the model hallucinates plausible high-frequency detail, so faces/text in very degraded
@@ -569,7 +619,7 @@ inputs may look "sharpened-plausible" rather than perfectly faithful.
 
 ## 11. Testing & Verification
 
-Both tests are self-contained scripts (no pytest needed); they use temporary directories
+All tests are self-contained scripts (no pytest needed); they use temporary directories
 and generate synthetic inputs.
 
 ### 11.1 Engine smoke test (headless, no GUI)
@@ -581,8 +631,9 @@ and generate synthetic inputs.
 ```
 
 Creates 3 small RGB PNGs (with crisp diagonal lines) + 1 RGBA PNG, runs a real 4× batch
-through `RealESRGANUpscaler`, and asserts every output is exactly **4× the source
-dimensions with the same color mode**. Prints `SMOKE TEST PASSED` / exit code 0 on success.
+through `RealESRGANUpscaler` (crop-to-fill disabled via `target_width=target_height=0`),
+and asserts every output is exactly **4× the source dimensions with the same color
+mode**. Prints `SMOKE TEST PASSED` / exit code 0 on success.
 
 ### 11.2 Worker batch test (GUI code path, offscreen Qt)
 
@@ -590,22 +641,39 @@ dimensions with the same color mode**. Prints `SMOKE TEST PASSED` / exit code 0 
 .\.venv\Scripts\python.exe -m tests.worker_batch_test
 ```
 
-Runs `BatchWorker` synchronously (`QT_QPA_PLATFORM=offscreen`) over a 6-image batch and
-asserts: all 6 outputs exist at 4×, zero failures, exactly one `"Model loaded and ready."`
-log (proving the **load-once-per-batch** invariant), and 6 progress events emitted.
+Runs `BatchWorker` synchronously (`QT_QPA_PLATFORM=offscreen`) over a 6-image batch with
+the **default 8000×5000 target left enabled**, asserting all 6 outputs exist at **exactly
+8000×5000**, zero failures, exactly one `"Model loaded and ready."` log (proving the
+**load-once-per-batch** invariant), and 6 progress events emitted.
 
-### 11.3 Max-size / transparency test (headless, no model)
+### 11.3 Target-size / crop-to-fill / transparency test (headless, no model)
 
 ```powershell
-.\.venv\Scripts\python.exe -m tests.max_size_test
+.\.venv\Scripts\python.exe -m tests.target_size_test
 ```
 
-Focused on the configurable output cap. Verifies `compute_fit_dimensions()` preserves
-aspect ratio and fits inside the bounds for many shapes (including the reference
-`20000×10000 → 8000×4000`, height-bound and width-bound cases, never-enlarge, and
-`0` disabling), and exercises `_fit_to_max()` + `_save()` on a real RGBA array to
-confirm the Lanczos downscale keeps PNG transparency and the saved dimensions fit
-within `max_width`×`max_height`. Prints `MAX SIZE TEST PASSED` / exit code 0 on success.
+Focused on the exact-output-size guarantee. Verifies `compute_fill_dimensions()` covers
+the target with a uniform scale for many shapes (downscale, upscale, same-ratio, extreme
+aspect ratios), that `_fill_to_target()` lands on **exactly** the target dimensions for
+every shape (including tiny sources that must be enlarged) and disables cleanly at `0×0`,
+that the crop is provably **centered** (edge content cut, middle content kept, symmetric
+output), and exercises `_save()` on real RGBA arrays to confirm PNG transparency survives
+crop-to-fill while JPEG still flattens to RGB. Prints `TARGET SIZE TEST PASSED` /
+exit code 0 on success.
+
+### 11.4 Folder-mode test (headless, no model)
+
+```powershell
+.\.venv\Scripts\python.exe -m tests.folder_mode_test
+```
+
+Exercises the *Add Folder…* path logic without loading the network: recursive
+scanning with `upscaled`-folder exclusion, empty-folder handling,
+structure-preserving `output_base_dir()` mapping (`<folder>/upscaled/<sub>`),
+non-collision of same-named files from different subfolders, honouring of
+suffix/format settings, fallback to the classic output modes for individually
+added images, and the `(1)` collision suffix. Prints `FOLDER MODE TEST PASSED`
+/ exit code 0 on success.
 
 ---
 

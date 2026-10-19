@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.engine.realesrgan_upscaler import UpscaleSettings, DEFAULT_MODEL_DIR, MODEL_FILENAME
-from app.engine.worker import BatchWorker, IMAGE_EXTENSIONS, collect_images
+from app.engine.worker import BatchWorker, IMAGE_EXTENSIONS, UPSCALED_DIR_NAME, collect_images
 
 
 def cuda_info() -> dict:
@@ -58,6 +58,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.worker: BatchWorker | None = None
         self._files: list[Path] = []
+        self._folder_roots: list[Path] = []  # folders added via Add Folder / drag-drop
         self._info = cuda_info()
 
         self._build_menu()
@@ -140,6 +141,11 @@ class MainWindow(QMainWindow):
         self.chk_same_dir = QCheckBox("Save beside each original")
         self.chk_same_dir.toggled.connect(lambda v: self.out_edit.setEnabled(not v))
         form.addWidget(self.chk_same_dir)
+        folder_hint = QLabel(
+            f"Folders added with \"Add Folder…\" always save to "
+            f"<folder>/{UPSCALED_DIR_NAME}/, keeping each image's subfolder path.")
+        folder_hint.setWordWrap(True)
+        form.addWidget(folder_hint)
 
         # Device
         dev_row = QHBoxLayout()
@@ -172,26 +178,28 @@ class MainWindow(QMainWindow):
         tile_row.addWidget(QLabel("0 = auto"))
         form.addLayout(tile_row)
 
-        # Max output size (final resize bounds)
-        form.addWidget(QLabel("Max output size (px):"))
-        max_row = QHBoxLayout()
-        self.maxw_spin = QSpinBox()
-        self.maxw_spin.setRange(0, 100000)
-        self.maxw_spin.setSingleStep(500)
-        self.maxw_spin.setValue(8000)
-        self.maxw_spin.setToolTip("Widest saved image; 0 = no width limit.")
-        self.maxh_spin = QSpinBox()
-        self.maxh_spin.setRange(0, 100000)
-        self.maxh_spin.setSingleStep(500)
-        self.maxh_spin.setValue(5000)
-        self.maxh_spin.setToolTip("Tallest saved image; 0 = no height limit.")
-        max_row.addWidget(self.maxw_spin, 1)
-        max_row.addWidget(QLabel("×"))
-        max_row.addWidget(self.maxh_spin, 1)
-        form.addLayout(max_row)
-        max_hint = QLabel("4× result is downscaled to fit within these bounds (aspect kept).")
-        max_hint.setWordWrap(True)
-        form.addWidget(max_hint)
+        # Exact target size (final crop-to-fill dimensions)
+        form.addWidget(QLabel("Exact target size (px):"))
+        target_row = QHBoxLayout()
+        self.targetw_spin = QSpinBox()
+        self.targetw_spin.setRange(0, 100000)
+        self.targetw_spin.setSingleStep(500)
+        self.targetw_spin.setValue(8000)
+        self.targetw_spin.setToolTip("Exact saved image width; 0 = disable crop-to-fill.")
+        self.targeth_spin = QSpinBox()
+        self.targeth_spin.setRange(0, 100000)
+        self.targeth_spin.setSingleStep(500)
+        self.targeth_spin.setValue(5000)
+        self.targeth_spin.setToolTip("Exact saved image height; 0 = disable crop-to-fill.")
+        target_row.addWidget(self.targetw_spin, 1)
+        target_row.addWidget(QLabel("×"))
+        target_row.addWidget(self.targeth_spin, 1)
+        form.addLayout(target_row)
+        target_hint = QLabel(
+            "Every output is exactly this size: the 4× result is resized to cover "
+            "it (aspect kept, never stretched) and center-cropped. 0 disables.")
+        target_hint.setWordWrap(True)
+        form.addWidget(target_hint)
 
         # Format
         fmt_row = QHBoxLayout()
@@ -258,9 +266,15 @@ class MainWindow(QMainWindow):
         else:
             self.log.appendPlainText("Model weights will download automatically on first run.")
 
-    def _add_paths(self, paths: list[Path]) -> None:
-        new = collect_images(paths)
-        existing = {str(p).lower() for p in self._files}
+    def _add_paths(self, paths: list[Path], scanned: list[Path] | None = None) -> None:
+        # Remember folder selections — their images use the <folder>/upscaled/ output.
+        known_roots = {str(r).lower() for r in self._folder_roots}
+        for p in paths:
+            if p.is_dir() and str(p).lower() not in known_roots:
+                self._folder_roots.append(p)
+                known_roots.add(str(p).lower())
+        new = collect_images(paths) if scanned is None else scanned
+        existing = {str(f).lower() for f in self._files}
         added = 0
         for p in new:
             if str(p).lower() not in existing:
@@ -285,8 +299,34 @@ class MainWindow(QMainWindow):
 
     def add_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select a folder", str(Path.home()))
-        if folder:
-            self._add_paths([Path(folder)])
+        if not folder:
+            return
+        root = Path(folder)
+        found = collect_images([root])
+        if not found:
+            QMessageBox.information(
+                self, "No images found",
+                f"No supported images were found in:\n{root}\n\n"
+                f"Nothing was added to the queue. (A previously generated "
+                f"'{UPSCALED_DIR_NAME}' output folder is skipped on purpose.)")
+            return
+        self._add_paths([root], scanned=found)
+        self.log.appendPlainText(
+            f"Folder mode: {len(found)} image(s) from {root} will be saved under "
+            f"{root / UPSCALED_DIR_NAME} with subfolders preserved.")
+
+    def _prune_folder_roots(self) -> None:
+        """Drop remembered folder roots that no queued image lives under."""
+        keep: list[Path] = []
+        for root in self._folder_roots:
+            for f in self._files:
+                try:
+                    Path(f).resolve().relative_to(root.resolve())
+                    keep.append(root)
+                    break
+                except (ValueError, OSError):
+                    continue
+        self._folder_roots = keep
 
     def browse_output(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose output folder", str(Path.home()))
@@ -297,11 +337,13 @@ class MainWindow(QMainWindow):
         for item in self.list.selectedItems():
             self._files.remove(Path(item.data(Qt.UserRole)))
             self.list.takeItem(self.list.row(item))
+        self._prune_folder_roots()
         self.status_label.setText(f"{len(self._files)} image(s) queued")
 
     def clear_queue(self) -> None:
         self.list.clear()
         self._files.clear()
+        self._folder_roots.clear()
         self.status_label.setText("0 image(s) queued")
 
     def show_about(self) -> None:
@@ -327,8 +369,8 @@ class MainWindow(QMainWindow):
             filename_suffix=self.suffix_edit.text(),
             keep_original_name=True,
             output_in_source_dir=self.chk_same_dir.isChecked(),
-            max_width=self.maxw_spin.value(),
-            max_height=self.maxh_spin.value(),
+            target_width=self.targetw_spin.value(),
+            target_height=self.targeth_spin.value(),
         )
 
     def start(self) -> None:
@@ -343,7 +385,8 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.log.appendPlainText(f"Starting batch of {len(self._files)} image(s)…")
 
-        self.worker = BatchWorker(list(self._files), out_dir, settings)
+        self.worker = BatchWorker(list(self._files), out_dir, settings,
+                                  folder_roots=list(self._folder_roots))
         self.worker.log_message.connect(self.log.appendPlainText)
         self.worker.progress.connect(self._on_progress)
         self.worker.image_started.connect(lambda n: self.status_label.setText(f"Processing {n}…"))
@@ -381,7 +424,7 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(running)
         for w in (self.device_combo, self.chk_fp16, self.tile_spin, self.format_combo,
                   self.quality_spin, self.chk_same_dir, self.out_edit, self.suffix_edit,
-                  self.maxw_spin, self.maxh_spin):
+                  self.targetw_spin, self.targeth_spin):
             w.setEnabled(not running)
         if running:
             self.chk_same_dir.setEnabled(False)

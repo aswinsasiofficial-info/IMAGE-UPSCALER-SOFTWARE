@@ -1,7 +1,8 @@
 """End-to-end test of the BatchWorker (the code path behind the Start button).
 
-Builds a synthetic batch, runs the worker synchronously and asserts every image
-is upscaled 4x and that the model is loaded only once for the whole batch.
+Builds a synthetic batch, runs the worker synchronously and asserts every
+saved output is exactly the default 8000x5000 crop-to-fill target and that
+the model is loaded only once for the whole batch.
 """
 
 from __future__ import annotations
@@ -42,6 +43,9 @@ def main() -> int:
         assert len(files) == n, f"expected {n} images, found {len(files)}"
 
         settings = UpscaleSettings(device="auto", fp16=True, tile=128, tile_pad=8)
+        # Default target is 8000x5000 — left on purpose to prove the worker's
+        # saved outputs land exactly on the configured target dimensions.
+        assert (settings.target_width, settings.target_height) == (8000, 5000)
         worker = BatchWorker(files, out, settings)
 
         logs: list[str] = []
@@ -58,18 +62,17 @@ def main() -> int:
 
         worker.run()  # run synchronously (no separate thread needed for the test)
 
-        # Every output must exist and be exactly 4x its source.
+        # Every output must exist and be exactly the crop-to-fill target size.
         ok = 0
         for f in files:
             expected = resolve_output_path(f, out, settings)
             if expected.exists():
                 with Image.open(expected) as im:
-                    with Image.open(f) as src_im:
-                        if im.size == (src_im.width * 4, src_im.height * 4):
-                            ok += 1
+                    if im.size == (settings.target_width, settings.target_height):
+                        ok += 1
 
         model_loads = sum(1 for line in logs if line == "Model loaded and ready.")
-        print(f"processed={len(done)} failed={len(failed)} correct_outputs={ok}/{n}")
+        print(f"processed={len(done)} failed={len(failed)} correct_outputs={ok}/{n} (expected size 8000x5000)")
         print(f"model_load_count={model_loads} (must be 1) progress_events={len(progress)}")
         for name, err in failed:
             print(f"  FAIL {name}: {err}")

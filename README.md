@@ -13,14 +13,20 @@ after the model weights are downloaded once.
 
 - **Batch processing** — queue 20-30+ images at once (files or whole folders,
   recursively). The model is loaded **once** and reused for every image.
+- **Folder mode** — when you add a folder, its results are saved inside
+  `<folder>/upscaled/` with the subfolder structure preserved (so
+  `photos/trip/image.jpg` → `upscaled/photos/trip/image_x4.jpg`), and that
+  output folder is skipped on later scans so results are never re-processed.
 - **Real-ESRGAN x4plus** — high-quality 4× super-resolution for photos,
   screenshots, artwork and anime-style images.
 - **CUDA + fp16** — runs on the GPU in half precision for speed and lower VRAM.
 - **VRAM-safe tiling** — large images are automatically split into overlapping
   tiles so they fit in 6 GB of VRAM (no out-of-memory crashes on big photos).
 - **RGBA / transparency preserved** — alpha channels are upscaled cleanly.
-- **Max output size** — the 4× result is downscaled (high-quality Lanczos) to fit
-  within a configurable cap (default **8000 × 5000 px**), preserving aspect ratio.
+- **Exact output size (crop-to-fill)** — every saved image is *exactly* the
+  configured target (default **8000 × 5000 px**): the 4× result is resized
+  (high-quality Lanczos, uniform scale — never stretched) to cover the target,
+  then center-cropped; smaller 4× results are enlarged to fill. `0` disables.
 - **PNG or JPEG output**, custom output folder (or save beside originals),
   configurable suffix, live progress bar, per-image logging and cancel.
 - **Drag & drop** or browse to add images.
@@ -66,10 +72,14 @@ Double-click **`run.bat`**, or from PowerShell:
 Then:
 
 1. **Add Images…** / **Add Folder…** (or drag & drop onto the window).
-2. Pick an **output folder**, or tick **Save beside each original**.
+2. Pick an **output folder**, or tick **Save beside each original**. Images
+   brought in via **Add Folder…** always go to `<folder>/upscaled/` instead,
+   keeping each image's relative subfolder path (this takes precedence for
+   those files).
 3. Choose **Device** (CUDA), keep **fp16** on, a **tile size** (256 is the
-   recommended default for a 6 GB GPU; `0` = no tiling), and the **max output
-   size** (default 8000 × 5000 — the 4× result is downscaled to fit within it).
+   recommended default for a 6 GB GPU; `0` = no tiling), and the **exact target
+   size** (default 8000 × 5000 — every output is resized to cover it and then
+   center-cropped to exactly that size; `0` disables crop-to-fill).
 4. Click **Start Upscaling**. Watch the progress bar and log; **Cancel** anytime.
 
 On the very first run the app downloads `RealESRGAN_x4plus.pth` into `models/`
@@ -84,7 +94,7 @@ and shows download progress in the status bar.
 | VRAM | Tile-based inference with an overlap pad (`tile=256`, `pad=16`) bounds peak memory for arbitrarily large inputs. |
 | Speed | `torch.inference_mode` + fp16 + cuDNN on the RTX 3050. |
 | Transparency | RGB is upscaled by the network; the alpha channel is resized with bicubic and recombined. |
-| Output size | After 4× inference the composited image is downscaled with Lanczos to fit the configurable max (default 8000 × 5000), aspect ratio preserved. |
+| Output size | After 4× inference the composited image is resized with Lanczos to *cover* the configurable target (default 8000 × 5000) at a uniform scale — never stretched — then center-cropped to exactly that size. |
 
 ### Tuning for your GPU
 
@@ -102,15 +112,25 @@ and shows download progress in the status bar.
 ```
 
 Generates a few test images, runs a real 4× batch and asserts the outputs are
-exactly 4× with the correct color mode.
+exactly 4× with the correct color mode (crop-to-fill is disabled for this test).
 
 ```powershell
-.\.venv\Scripts\python.exe -m tests.max_size_test
+.\.venv\Scripts\python.exe -m tests.target_size_test
 ```
 
-Checks the max-output-size behaviour: aspect-ratio/fit-inside math, the reference
-`20000×10000 → 8000×4000` case, and that a PNG with transparency keeps its alpha
-after the final Lanczos downscale (no GPU/model required).
+Checks the exact-target-size behaviour: cover/aspect math, every output landing
+on exactly the target dimensions (including enlarging small sources), centered-crop
+correctness, and that a PNG with transparency keeps its alpha after crop-to-fill
+(no GPU/model required).
+
+```powershell
+.\.venv\Scripts\python.exe -m tests.folder_mode_test
+```
+
+Verifies the folder-mode path logic without running the model: recursive scanning,
+exclusion of the `upscaled` output folder, structure-preserving output paths
+(`<folder>/upscaled/<sub>/<name>_x4.<ext>`), fallback to the classic output modes,
+and collision handling.
 
 ## Project layout
 
@@ -125,7 +145,8 @@ app/
     main_window.py            # PySide6 desktop UI
 tests/
   smoke_test.py               # headless end-to-end check
-  max_size_test.py            # max-output-size + transparency resize check
+  target_size_test.py         # exact-target crop-to-fill + transparency check
+  folder_mode_test.py         # folder-mode scanning/output-path check
 models/                       # downloaded weights (auto-created)
 setup.ps1 · run.bat · run.ps1 · requirements.txt
 ```

@@ -7,9 +7,9 @@ Responsibilities:
     optionally run in half precision.
   * Upscale a single image file end-to-end: EXIF-aware load, alpha (RGBA)
     handling, tile-based inference so a 6GB RTX 3050 never runs out of memory,
-    a final high-quality (LANCZOS) downscale so the result fits within the
-    configured maximum dimensions (aspect ratio preserved), and save as
-    PNG/JPEG.
+    a final crop-to-fill resize (high-quality LANCZOS) so every saved image is
+    *exactly* the configured target dimensions (default 8000 × 5000) without
+    stretching, and save as PNG/JPEG.
 
 The model is loaded once via :meth:`RealESRGANUpscaler.load` and reused for the
 whole batch — that reuse is what makes batch processing of 20-30 images fast.
@@ -17,6 +17,7 @@ whole batch — that reuse is what makes batch processing of 20-30 images fast.
 
 from __future__ import annotations
 
+import math
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,10 +58,11 @@ class UpscaleSettings:
     filename_suffix: str = "_x4"
     keep_original_name: bool = True
     output_in_source_dir: bool = False  # True: write next to each source; False: use chosen folder
-    # Final output bounds (px). The 4x AI result is downscaled to *fit within*
-    # these dimensions while preserving aspect ratio; 0 disables the resize.
-    max_width: int = 8000
-    max_height: int = 5000
+    # Exact saved output size (px). The 4x AI result is resized to *cover* this
+    # box (aspect ratio kept, may enlarge) and center-cropped to exactly these
+    # dimensions. Setting either to 0 disables crop-to-fill (keeps the 4x size).
+    target_width: int = 8000
+    target_height: int = 5000
 
     @staticmethod
     def recommended_tile_for_vram(total_vram_gb: float) -> int:
@@ -230,40 +232,43 @@ class RealESRGANUpscaler:
         else:
             img.save(out_path, "PNG", optimize=False)
 
-    # -- final resize to configured maximum ----------------------------------
+    # -- final crop-to-fill resize to exact target dimensions -----------------
     @staticmethod
-    def compute_fit_dimensions(width: int, height: int, max_width: int, max_height: int) -> tuple[int, int]:
-        """Largest (w, h) fitting inside the max bounds, preserving aspect ratio.
+    def compute_fill_dimensions(width: int, height: int, target_width: int, target_height: int) -> tuple[int, int]:
+        """Smallest size that fully covers the target box, preserving aspect ratio.
 
-        Never enlarges: an image already within the bounds is returned unchanged.
-        ``max_width``/``max_height`` <= 0 disable the cap for that axis. The scale
-        factor is chosen so *both* axes fit (fit-inside, no crop/stretch).
+        Scale is ``max(target_width / width, target_height / height)`` so *both*
+        axes are at least the target size; the excess is removed by a centered
+        crop afterwards. Never stretches (uniform scale) and rounding is
+        ceil-clamped so the crop can always succeed.
         """
-        if max_width <= 0 and max_height <= 0:
-            return width, height
-        limit_w = max_width if max_width > 0 else width
-        limit_h = max_height if max_height > 0 else height
-        if width <= limit_w and height <= limit_h:
-            return width, height
-        scale = min(limit_w / width, limit_h / height)
-        new_w = max(1, round(width * scale))
-        new_h = max(1, round(height * scale))
-        return new_w, new_h
+        scale = max(target_width / width, target_height / height)
+        fill_w = max(target_width, math.ceil(width * scale))
+        fill_h = max(target_height, math.ceil(height * scale))
+        return fill_w, fill_h
 
-    def _fit_to_max(self, array_hwc: np.ndarray) -> np.ndarray:
-        """Downscale the finished (RGBA-aware) image so it fits the max bounds.
+    def _fill_to_target(self, array_hwc: np.ndarray) -> tuple[np.ndarray, bool]:
+        """Resize + center-crop the finished (RGBA-aware) image to the exact target.
 
-        Uses a high-quality LANCZOS filter for this *final* resize only; the
-        network's internal upsampling is untouched. Runs on the fully composited
-        array so PNG transparency is preserved.
+        Returns ``(array, was_cropped)``. Uses a high-quality LANCZOS filter for
+        this *final* resize only; the network's internal upsampling is untouched.
+        Enlarges small 4x results when needed to cover the target. Runs on the
+        fully composited array so PNG transparency is preserved. ``target_*``
+        <= 0 disables the operation (the array is returned unchanged).
         """
         h, w = array_hwc.shape[:2]
-        new_w, new_h = self.compute_fit_dimensions(
-            w, h, self.settings.max_width, self.settings.max_height)
-        if (new_w, new_h) == (w, h):
-            return array_hwc
-        img = Image.fromarray(array_hwc).resize((new_w, new_h), Image.Resampling.LANCZOS)
-        return np.asarray(img)
+        tw, th = self.settings.target_width, self.settings.target_height
+        if tw <= 0 or th <= 0 or (w, h) == (tw, th):
+            return array_hwc, False
+        fill_w, fill_h = self.compute_fill_dimensions(w, h, tw, th)
+        img = Image.fromarray(array_hwc)
+        if (fill_w, fill_h) != (w, h):
+            img = img.resize((fill_w, fill_h), Image.Resampling.LANCZOS)
+        # Centered crop to exactly the target dimensions.
+        left = (fill_w - tw) // 2
+        top = (fill_h - th) // 2
+        img = img.crop((left, top, left + tw, top + th))
+        return np.asarray(img), (fill_w, fill_h) != (tw, th)
 
     # -- inference ------------------------------------------------------------
     @torch.inference_mode()
@@ -337,14 +342,19 @@ class RealESRGANUpscaler:
         out_np = (out.squeeze(0).permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
         out_np = self._merge_alpha(out_np, alpha)
         ai_w, ai_h = out_np.shape[1], out_np.shape[0]
-        out_np = self._fit_to_max(out_np)
+        out_np, was_cropped = self._fill_to_target(out_np)
         self._save(out_np, out_path)
 
         if log:
             saved_w, saved_h = out_np.shape[1], out_np.shape[0]
+            target_on = self.settings.target_width > 0 and self.settings.target_height > 0
             if (saved_w, saved_h) != (ai_w, ai_h):
+                step = "center-cropped" if was_cropped else "resized"
                 log(f"[OK] {in_path.name}: {src_w}x{src_h} -> {ai_w}x{ai_h} "
-                    f"-> resized {saved_w}x{saved_h}")
+                    f"-> {step} to exact target {saved_w}x{saved_h}")
+            elif target_on:
+                log(f"[OK] {in_path.name}: {src_w}x{src_h} -> {saved_w}x{saved_h} "
+                    f"(already exact target)")
             else:
                 log(f"[OK] {in_path.name}: {src_w}x{src_h} -> {saved_w}x{saved_h}")
         return out_path

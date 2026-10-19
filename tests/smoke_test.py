@@ -1,7 +1,8 @@
 """Headless smoke test for the upscaler engine (no GUI required).
 
 Generates a few synthetic images (RGB + RGBA), runs a real batch through
-Real-ESRGAN x4plus and asserts the outputs have the expected 4x dimensions.
+Real-ESRGAN x4plus and asserts the outputs have the expected 4x dimensions
+(the crop-to-fill target resize is disabled for this test).
 
 Usage:
     .venv\\Scripts\\python -m tests.smoke_test            # auto device
@@ -61,6 +62,9 @@ def main() -> int:
             tile=args.tile,
             tile_pad=8,
             output_format="png",
+            # Disable crop-to-fill so the pure 4x inference stays assertable.
+            target_width=0,
+            target_height=0,
         )
         up = RealESRGANUpscaler(settings)
         up.load(log=print)
