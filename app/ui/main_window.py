@@ -222,6 +222,17 @@ class MainWindow(QMainWindow):
         self.suffix_edit.setText("_x4")
         suf_row.addWidget(self.suffix_edit, 1)
         form.addLayout(suf_row)
+
+        # Batch rename (random prefix + sequential number)
+        self.chk_rename = QCheckBox(
+            "Rename batch (e.g. ABCD1, ABCD2…) — ignores original names")
+        self.chk_rename.setToolTip(
+            "Name every output <PREFIX><number>.<ext> using one random 4-5 letter "
+            "uppercase prefix shared across the batch, numbered from 1. "
+            "Numbering restarts at 1 in each output folder. The suffix is ignored.")
+        self.chk_rename.toggled.connect(self._on_rename_toggled)
+        form.addWidget(self.chk_rename)
+
         self._on_format_changed(self.format_combo.currentText())
 
         form.addStretch(1)
@@ -258,6 +269,10 @@ class MainWindow(QMainWindow):
     # -- helpers --------------------------------------------------------------
     def _on_format_changed(self, fmt: str) -> None:
         self.quality_spin.setEnabled(fmt == "jpg")
+
+    def _on_rename_toggled(self, checked: bool) -> None:
+        # The suffix is irrelevant when batch-renaming; grey it out for clarity.
+        self.suffix_edit.setEnabled(not checked)
 
     def _refresh_model_hint(self) -> None:
         weights = DEFAULT_MODEL_DIR / MODEL_FILENAME
@@ -368,6 +383,7 @@ class MainWindow(QMainWindow):
             jpg_quality=self.quality_spin.value(),
             filename_suffix=self.suffix_edit.text(),
             keep_original_name=True,
+            rename_batch=self.chk_rename.isChecked(),
             output_in_source_dir=self.chk_same_dir.isChecked(),
             target_width=self.targetw_spin.value(),
             target_height=self.targeth_spin.value(),
@@ -424,13 +440,14 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(running)
         for w in (self.device_combo, self.chk_fp16, self.tile_spin, self.format_combo,
                   self.quality_spin, self.chk_same_dir, self.out_edit, self.suffix_edit,
-                  self.targetw_spin, self.targeth_spin):
+                  self.chk_rename, self.targetw_spin, self.targeth_spin):
             w.setEnabled(not running)
         if running:
             self.chk_same_dir.setEnabled(False)
         else:
             self.chk_same_dir.setEnabled(True)
             self.out_edit.setEnabled(not self.chk_same_dir.isChecked())
+            self.suffix_edit.setEnabled(not self.chk_rename.isChecked())
 
     # -- drag & drop ----------------------------------------------------------
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802

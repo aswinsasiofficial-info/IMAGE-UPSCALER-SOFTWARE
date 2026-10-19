@@ -8,6 +8,8 @@ batching), and cancellation is checked between images.
 
 from __future__ import annotations
 
+import random
+import string
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -61,6 +63,44 @@ def resolve_output_path(src: Path, out_dir: Path, settings: UpscaleSettings) -> 
     ext = ".jpg" if settings.output_format == "jpg" else ".png"
     suffix = settings.filename_suffix if settings.keep_original_name else ""
     return out_dir / f"{src.stem}{suffix}{ext}"
+
+
+class BatchNamePlanner:
+    """Assign ``<PREFIX><n>.<ext>`` names for a batch-rename run.
+
+    A single random uppercase alphabetic prefix (4-5 letters) is shared by the
+    whole batch, followed by a sequential number starting at 1 (e.g. ``KQATZ1``).
+    Each output directory keeps its own counter so folder-mode subfolders stay
+    gap-free and never collide, and existing files are skipped rather than
+    overwritten.
+    """
+
+    def __init__(self, prefix: str | None = None) -> None:
+        self.prefix = prefix or self.new_prefix()
+        self._counters: dict[str, int] = {}
+
+    @staticmethod
+    def new_prefix() -> str:
+        """A random 4- or 5-letter uppercase alphabetic prefix."""
+        length = random.randint(4, 5)
+        return "".join(random.choice(string.ascii_uppercase) for _ in range(length))
+
+    def next_path(self, base_dir: Path, ext: str) -> Path:
+        """Reserve the next unused ``<prefix><n><ext>`` path inside *base_dir*."""
+        key = str(base_dir.resolve()).lower()
+        n = self._counters.get(key, 0) + 1
+        out = base_dir / f"{self.prefix}{n}{ext}"
+        while out.exists():
+            n += 1
+            out = base_dir / f"{self.prefix}{n}{ext}"
+        self._counters[key] = n
+        return out
+
+    def rollback(self, base_dir: Path) -> None:
+        """Release the number last reserved for *base_dir* (keep sequence gap-free)."""
+        key = str(base_dir.resolve()).lower()
+        if self._counters.get(key, 0) > 0:
+            self._counters[key] -= 1
 
 
 class BatchWorker(QThread):
@@ -140,21 +180,33 @@ class BatchWorker(QThread):
             self.finished_all.emit(0, total)
             return
 
+        planner = BatchNamePlanner() if self.settings.rename_batch else None
+        ext = ".jpg" if self.settings.output_format == "jpg" else ".png"
+        if planner is not None:
+            self.log_message.emit(
+                f"Batch rename on: outputs will be named {planner.prefix}1{ext}, "
+                f"{planner.prefix}2{ext}, … (numbering restarts at 1 per folder).")
+
         for idx, src in enumerate(self.files):
             if self._cancel:
                 self.log_message.emit("Cancelled by user.")
                 self.cancelled.emit()
                 break
             self.image_started.emit(src.name)
+            base_dir = None
             try:
                 base_dir = self.output_base_dir(src)
-                out_path = resolve_output_path(src, base_dir, self.settings)
-                out_path = self._avoid_collision(out_path)
+                if planner is not None:
+                    out_path = planner.next_path(base_dir, ext)
+                else:
+                    out_path = self._avoid_collision(resolve_output_path(src, base_dir, self.settings))
                 self._upscaler.upscale_image(src, out_path, log=self.log_message.emit)
                 succeeded += 1
                 self.image_done.emit(src.name, str(out_path))
             except Exception as exc:
                 failed += 1
+                if planner is not None and base_dir is not None:
+                    planner.rollback(base_dir)
                 self.image_failed.emit(src.name, str(exc))
                 self.log_message.emit(f"✗ {src.name}: {exc}")
             finally:
