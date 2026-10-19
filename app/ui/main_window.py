@@ -172,6 +172,27 @@ class MainWindow(QMainWindow):
         tile_row.addWidget(QLabel("0 = auto"))
         form.addLayout(tile_row)
 
+        # Max output size (final resize bounds)
+        form.addWidget(QLabel("Max output size (px):"))
+        max_row = QHBoxLayout()
+        self.maxw_spin = QSpinBox()
+        self.maxw_spin.setRange(0, 100000)
+        self.maxw_spin.setSingleStep(500)
+        self.maxw_spin.setValue(8000)
+        self.maxw_spin.setToolTip("Widest saved image; 0 = no width limit.")
+        self.maxh_spin = QSpinBox()
+        self.maxh_spin.setRange(0, 100000)
+        self.maxh_spin.setSingleStep(500)
+        self.maxh_spin.setValue(5000)
+        self.maxh_spin.setToolTip("Tallest saved image; 0 = no height limit.")
+        max_row.addWidget(self.maxw_spin, 1)
+        max_row.addWidget(QLabel("×"))
+        max_row.addWidget(self.maxh_spin, 1)
+        form.addLayout(max_row)
+        max_hint = QLabel("4× result is downscaled to fit within these bounds (aspect kept).")
+        max_hint.setWordWrap(True)
+        form.addWidget(max_hint)
+
         # Format
         fmt_row = QHBoxLayout()
         fmt_row.addWidget(QLabel("Format:"))
@@ -306,6 +327,8 @@ class MainWindow(QMainWindow):
             filename_suffix=self.suffix_edit.text(),
             keep_original_name=True,
             output_in_source_dir=self.chk_same_dir.isChecked(),
+            max_width=self.maxw_spin.value(),
+            max_height=self.maxh_spin.value(),
         )
 
     def start(self) -> None:
@@ -357,7 +380,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         for w in (self.device_combo, self.chk_fp16, self.tile_spin, self.format_combo,
-                  self.quality_spin, self.chk_same_dir, self.out_edit, self.suffix_edit):
+                  self.quality_spin, self.chk_same_dir, self.out_edit, self.suffix_edit,
+                  self.maxw_spin, self.maxh_spin):
             w.setEnabled(not running)
         if running:
             self.chk_same_dir.setEnabled(False)

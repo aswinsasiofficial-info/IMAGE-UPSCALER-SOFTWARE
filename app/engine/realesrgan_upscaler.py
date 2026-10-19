@@ -7,7 +7,9 @@ Responsibilities:
     optionally run in half precision.
   * Upscale a single image file end-to-end: EXIF-aware load, alpha (RGBA)
     handling, tile-based inference so a 6GB RTX 3050 never runs out of memory,
-    and save as PNG/JPEG.
+    a final high-quality (LANCZOS) downscale so the result fits within the
+    configured maximum dimensions (aspect ratio preserved), and save as
+    PNG/JPEG.
 
 The model is loaded once via :meth:`RealESRGANUpscaler.load` and reused for the
 whole batch — that reuse is what makes batch processing of 20-30 images fast.
@@ -55,6 +57,10 @@ class UpscaleSettings:
     filename_suffix: str = "_x4"
     keep_original_name: bool = True
     output_in_source_dir: bool = False  # True: write next to each source; False: use chosen folder
+    # Final output bounds (px). The 4x AI result is downscaled to *fit within*
+    # these dimensions while preserving aspect ratio; 0 disables the resize.
+    max_width: int = 8000
+    max_height: int = 5000
 
     @staticmethod
     def recommended_tile_for_vram(total_vram_gb: float) -> int:
@@ -224,6 +230,41 @@ class RealESRGANUpscaler:
         else:
             img.save(out_path, "PNG", optimize=False)
 
+    # -- final resize to configured maximum ----------------------------------
+    @staticmethod
+    def compute_fit_dimensions(width: int, height: int, max_width: int, max_height: int) -> tuple[int, int]:
+        """Largest (w, h) fitting inside the max bounds, preserving aspect ratio.
+
+        Never enlarges: an image already within the bounds is returned unchanged.
+        ``max_width``/``max_height`` <= 0 disable the cap for that axis. The scale
+        factor is chosen so *both* axes fit (fit-inside, no crop/stretch).
+        """
+        if max_width <= 0 and max_height <= 0:
+            return width, height
+        limit_w = max_width if max_width > 0 else width
+        limit_h = max_height if max_height > 0 else height
+        if width <= limit_w and height <= limit_h:
+            return width, height
+        scale = min(limit_w / width, limit_h / height)
+        new_w = max(1, round(width * scale))
+        new_h = max(1, round(height * scale))
+        return new_w, new_h
+
+    def _fit_to_max(self, array_hwc: np.ndarray) -> np.ndarray:
+        """Downscale the finished (RGBA-aware) image so it fits the max bounds.
+
+        Uses a high-quality LANCZOS filter for this *final* resize only; the
+        network's internal upsampling is untouched. Runs on the fully composited
+        array so PNG transparency is preserved.
+        """
+        h, w = array_hwc.shape[:2]
+        new_w, new_h = self.compute_fit_dimensions(
+            w, h, self.settings.max_width, self.settings.max_height)
+        if (new_w, new_h) == (w, h):
+            return array_hwc
+        img = Image.fromarray(array_hwc).resize((new_w, new_h), Image.Resampling.LANCZOS)
+        return np.asarray(img)
+
     # -- inference ------------------------------------------------------------
     @torch.inference_mode()
     def _infer_tensor(self, t: torch.Tensor) -> torch.Tensor:
@@ -295,10 +336,17 @@ class RealESRGANUpscaler:
         out = torch.clamp(out, 0.0, 1.0)
         out_np = (out.squeeze(0).permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
         out_np = self._merge_alpha(out_np, alpha)
+        ai_w, ai_h = out_np.shape[1], out_np.shape[0]
+        out_np = self._fit_to_max(out_np)
         self._save(out_np, out_path)
 
         if log:
-            log(f"[OK] {in_path.name}: {src_w}x{src_h} -> {out_np.shape[1]}x{out_np.shape[0]}")
+            saved_w, saved_h = out_np.shape[1], out_np.shape[0]
+            if (saved_w, saved_h) != (ai_w, ai_h):
+                log(f"[OK] {in_path.name}: {src_w}x{src_h} -> {ai_w}x{ai_h} "
+                    f"-> resized {saved_w}x{saved_h}")
+            else:
+                log(f"[OK] {in_path.name}: {src_w}x{src_h} -> {saved_w}x{saved_h}")
         return out_path
 
     def cleanup(self) -> None:

@@ -19,6 +19,8 @@ after the model weights are downloaded once.
 - **VRAM-safe tiling** — large images are automatically split into overlapping
   tiles so they fit in 6 GB of VRAM (no out-of-memory crashes on big photos).
 - **RGBA / transparency preserved** — alpha channels are upscaled cleanly.
+- **Max output size** — the 4× result is downscaled (high-quality Lanczos) to fit
+  within a configurable cap (default **8000 × 5000 px**), preserving aspect ratio.
 - **PNG or JPEG output**, custom output folder (or save beside originals),
   configurable suffix, live progress bar, per-image logging and cancel.
 - **Drag & drop** or browse to add images.
@@ -65,8 +67,9 @@ Then:
 
 1. **Add Images…** / **Add Folder…** (or drag & drop onto the window).
 2. Pick an **output folder**, or tick **Save beside each original**.
-3. Choose **Device** (CUDA), keep **fp16** on, and a **tile size** (256 is the
-   recommended default for a 6 GB GPU; `0` = no tiling).
+3. Choose **Device** (CUDA), keep **fp16** on, a **tile size** (256 is the
+   recommended default for a 6 GB GPU; `0` = no tiling), and the **max output
+   size** (default 8000 × 5000 — the 4× result is downscaled to fit within it).
 4. Click **Start Upscaling**. Watch the progress bar and log; **Cancel** anytime.
 
 On the very first run the app downloads `RealESRGAN_x4plus.pth` into `models/`
@@ -81,6 +84,7 @@ and shows download progress in the status bar.
 | VRAM | Tile-based inference with an overlap pad (`tile=256`, `pad=16`) bounds peak memory for arbitrarily large inputs. |
 | Speed | `torch.inference_mode` + fp16 + cuDNN on the RTX 3050. |
 | Transparency | RGB is upscaled by the network; the alpha channel is resized with bicubic and recombined. |
+| Output size | After 4× inference the composited image is downscaled with Lanczos to fit the configurable max (default 8000 × 5000), aspect ratio preserved. |
 
 ### Tuning for your GPU
 
@@ -100,6 +104,14 @@ and shows download progress in the status bar.
 Generates a few test images, runs a real 4× batch and asserts the outputs are
 exactly 4× with the correct color mode.
 
+```powershell
+.\.venv\Scripts\python.exe -m tests.max_size_test
+```
+
+Checks the max-output-size behaviour: aspect-ratio/fit-inside math, the reference
+`20000×10000 → 8000×4000` case, and that a PNG with transparency keeps its alpha
+after the final Lanczos downscale (no GPU/model required).
+
 ## Project layout
 
 ```
@@ -113,6 +125,7 @@ app/
     main_window.py            # PySide6 desktop UI
 tests/
   smoke_test.py               # headless end-to-end check
+  max_size_test.py            # max-output-size + transparency resize check
 models/                       # downloaded weights (auto-created)
 setup.ps1 · run.bat · run.ps1 · requirements.txt
 ```
