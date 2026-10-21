@@ -32,6 +32,9 @@ Write-Host "Installing PyTorch (CUDA 12.6 build) — this is a ~2.6 GB download�
 Write-Host "Installing GUI + imaging dependencies…"
 & $py -m pip install PySide6 Pillow numpy
 
+Write-Host "Installing Metadata Generator dependencies…"
+& $py -m pip install google-genai requests keyring
+
 Write-Host "`nVerifying CUDA availability…"
 & $py -c "import torch; print('torch', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
 

@@ -10,3 +10,11 @@ torchvision==0.29.1+cu126
 PySide6>=6.8
 Pillow>=10.0
 numpy>=1.26
+
+# Metadata Generator (optional — only needed for the Metadata screen).
+# Gemini uses the official SDK; Groq is called through its OpenAI-compatible
+# HTTPS API via requests. Keys can optionally be kept in Windows Credential
+# Manager with keyring. The app runs without these; only generation fails.
+google-genai>=1.0
+requests>=2.31
+keyring>=25

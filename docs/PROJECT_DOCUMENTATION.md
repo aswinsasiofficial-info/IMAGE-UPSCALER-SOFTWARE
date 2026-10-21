@@ -1,6 +1,6 @@
-# Batch Image Upscaler — Comprehensive Project Documentation
+# Batch Image Upscaler + Metadata Generator — Comprehensive Project Documentation
 
-**Version:** 1.3 · **Model:** Real-ESRGAN `x4plus` · **Stack:** Python 3.10+, PyTorch (CUDA 12.6), PySide6 (Qt 6)
+**Version:** 1.4 · **Model:** Real-ESRGAN `x4plus` · **Stack:** Python 3.10+, PyTorch (CUDA 12.6), PySide6 (Qt 6)
 
 A fully local, GPU-accelerated Windows desktop application that batch-upscales images **4×**
 using the **Real-ESRGAN x4plus** super-resolution model. It is tuned to run on an
@@ -8,6 +8,11 @@ using the **Real-ESRGAN x4plus** super-resolution model. It is tuned to run on a
 and requires **no internet connection after the one-time model-weight download**.
 Every saved output is **exactly 8000 × 5000 px by default** (configurable), reached by a
 crop-to-fill resize that never stretches the image.
+
+Since v1.4 the app also hosts a second, **completely independent** feature screen —
+the **Metadata Generator** (top navigation → *Metadata*) — which produces Adobe
+Stock–ready titles/descriptions/keywords for already-saved images using **Gemini** or
+**Groq**. See [Section 14 — Metadata Generator](#14-metadata-generator).
 
 > **Note on resampling:** the neural network's internal upsampling uses
 > **nearest-neighbor** (feature-space) and the alpha-channel resize uses
@@ -35,7 +40,8 @@ crop-to-fill resize that never stretches the image.
 11. [Testing & Verification](#11-testing--verification)
 12. [Performance Tuning](#12-performance-tuning)
 13. [Troubleshooting](#13-troubleshooting)
-14. [License & Credits](#14-license--credits)
+14. [Metadata Generator](#14-metadata-generator)
+15. [License & Credits](#15-license--credits)
 
 ---
 
@@ -93,16 +99,25 @@ d:\Upscaler\
 │   ├── engine/
 │   │   ├── rrdbnet.py               # Real-ESRGAN x4plus network architecture
 │   │   ├── realesrgan_upscaler.py   # weights, tiled inference, image I/O
-│   │   └── worker.py                # QThread batch runner (progress + cancel)
+│   │   ├── worker.py                # QThread batch runner (progress + cancel)
+│   │   ├── metadata_settings.py     # metadata dataclasses, Adobe limits, JSON parsing
+│   │   ├── metadata_providers.py    # Gemini + Groq callers (retry, backoff)
+│   │   ├── metadata_worker.py       # QThread metadata batch runner
+│   │   ├── metadata_export.py       # contributor CSV + PNG/JPEG in-file embedder
+│   │   └── credential_store.py      # API keys: session → env → Windows keyring
 │   └── ui/
-│       └── main_window.py           # PySide6 desktop UI
+│       ├── main_window.py           # shell: top navigation + stacked pages
+│       ├── upscale_page.py          # upscaler screen (behaviour unchanged)
+│       ├── metadata_page.py         # Metadata Generator screen
+│       └── metadata_review.py       # final review table + export options
 ├── models/
 │   └── RealESRGAN_x4plus.pth        # pretrained weights (~67 MB, auto-downloaded)
 ├── tests/
 │   ├── smoke_test.py                # headless end-to-end engine check
 │   ├── worker_batch_test.py         # BatchWorker path test (offscreen Qt)
 │   ├── target_size_test.py          # exact-target crop-to-fill + transparency test
-│   └── folder_mode_test.py          # folder-mode scan/output-path test (no model)
+│   ├── folder_mode_test.py          # folder-mode scan/output-path test (no model)
+│   └── metadata_test.py             # metadata engine/worker/UI test (no network)
 ├── setup.ps1                        # one-time environment installer
 ├── run.bat                          # double-click launcher
 ├── run.ps1                          # PowerShell launcher
@@ -224,11 +239,16 @@ Constants: `MODEL_URL` (official GitHub release), `MODEL_FILENAME`,
   A setup failure (e.g. weights unreachable) aborts the whole batch early with
   `finished_all(0, total)`.
 
-### 3.5 `app/ui/main_window.py` — Desktop GUI
+### 3.5 `app/ui/main_window.py` — Application Shell
 
-See Section 8. Also exposes `cuda_info()`, a best-effort torch probe returning
+Since v1.4 the main window is a thin shell: a `QStackedWidget` holding the two
+feature pages (`UpscalePage`, `MetadataPage`) plus exclusive top-navigation
+actions **Upscaler** / **Metadata** and **About**. The upscaler screen itself
+moved verbatim to `app/ui/upscale_page.py` — its behaviour is unchanged. Also
+exposes `cuda_info()`, a best-effort torch probe returning
 `{available, name, vram_gb, torch}` used to preconfigure the UI (default device,
 fp16 checkbox, recommended tile size) and populate the status bar.
+The metadata modules are documented in [Section 14](#14-metadata-generator).
 
 ---
 
@@ -243,6 +263,9 @@ fp16 checkbox, recommended tile size) and populate the status bar.
 | `PySide6` | `>=6.8` | Qt 6 GUI toolkit | `QMainWindow`, `QThread`, signals/slots, widgets |
 | `Pillow` | `>=10.0` | Image decode/encode, EXIF transpose, alpha handling, resampling | |
 | `numpy` | `>=1.26` | Array conversion between PIL and tensors | |
+| `google-genai` | `>=1.0` | Gemini provider (Metadata screen) | **Optional** — only the metadata feature needs it |
+| `requests` | `>=2.31` | Groq provider via its OpenAI-compatible HTTPS API | **Optional** — normally already present |
+| `keyring` | `>=25` | "Remember key" storage in Windows Credential Manager | **Optional** |
 
 The CUDA wheel set is a **~2.6 GB download** — expect several GB of free disk (~4 GB total).
 Because of the `+cu126` local version specifiers, plain `pip install -r requirements.txt`
@@ -712,7 +735,92 @@ added images, and the `(1)` collision suffix. Prints `FOLDER MODE TEST PASSED`
 
 ---
 
-## 14. License & Credits
+## 14. Metadata Generator
+
+An **independent second screen** added in v1.4 (top navigation → *Metadata*).
+It generates Adobe Stock–ready **title / description / keywords** for image
+files that already exist on disk — typically the output of the upscaler, but
+any folder works. There is **no code path between the two features**: the
+upscaler never triggers metadata, and the metadata screen never loads torch.
+
+### 14.1 Flow
+
+```
+MetadataPage (app/ui/metadata_page.py)
+  add images/folder → thumbnail grid (status-coloured tiles, per-image tooltip)
+  → MetadataWorker (QThread) loops over EVERY queued image:
+      prepare_analysis_bytes()  in-memory ≤1024 px JPEG (file on disk untouched)
+      build_prompt()            JSON contract + language + keyword budget
+      _call_gemini() | _call_groq()   provider dispatch, retry/backoff
+      parse_model_json() + sanitize_metadata()   Adobe limits enforced
+  → item_done/item_failed → grid colour + editor panel (all fields editable)
+  → folder batch where EVERY image succeeded → write_csv() auto-exports
+    metadata.csv into the selected folder (metadata_2.csv, … if one already
+    exists; never overwritten). Any failure or cancellation → no auto-export;
+    successful/failed rows stay in the list for Retry Failed
+  → ReviewDialog (app/ui/metadata_review.py)  read-only table + warnings
+  → exports:
+      write_csv()      Filename, Title, Description, Keywords (UTF-8 BOM)
+      embed_metadata() PNG tEXt chunks / JPEG COM comment — copies or in place
+```
+
+### 14.2 Modules
+
+| Module | Responsibility |
+|---|---|
+| `app/engine/metadata_settings.py` | `MetadataSettings` / `ImageMetadata` dataclasses; Adobe constants (title ≤ 70, keywords ≤ 49 kept of 50); prompt building; robust JSON extraction (`parse_model_json` sanitises fences/prose, dedups keywords); `prepare_analysis_bytes` |
+| `app/engine/metadata_providers.py` | `generate_metadata()` dispatches Gemini (official `google-genai` SDK) or Groq (OpenAI-compatible endpoint via `requests`). Retries transient errors (408/409/425/429/5xx) up to 3 attempts with exponential backoff; permanent errors surface immediately. SDK exceptions are **never reconstructed** — they are wrapped in `ProviderError(message, code)`. A Gemini 404 retirement message is parsed for the suggested replacement model and surfaced in the error text; model combos are editable so the user can switch without a code change |
+| `app/engine/metadata_worker.py` | `MetadataWorker(QThread)`: loops the whole queue sequentially; emits `item_started(path, index, total)`/`item_done`/`item_failed` keyed by **full path** (same-named files in different folders stay distinct), plus `progress`/`finished_all`/`cancel` semantics identical to `BatchWorker`. A per-image failure never aborts the batch |
+| `app/engine/metadata_export.py` | Contributor CSV (comma-joined keywords, `utf-8-sig` so Excel opens UTF-8) and in-file embedding: PNG `PngInfo` tEXt chunks, JPEG COM comment with a JSON payload (`quality="keep"` so pixels aren't re-degraded). Writes go to a temp file + `os.replace` so an in-place rewrite can never half-overwrite; non-PNG/JPEG raise a clear error |
+| `app/engine/credential_store.py` | API key resolution order: in-session (typed) → env var (`GEMINI_API_KEY` / `GROQ_API_KEY`) → Windows Credential Manager via `keyring`. Optional "Remember" persists to keyring; keys are never logged or exported |
+| `app/ui/metadata_page.py` | The screen: grid preview + provider/model/key/language/keyword-count options, editor panel for the selected tile, per-image status, **Generate Metadata / Retry Failed / Regenerate Selected**, and **Review & Export…**. Remembers folder selections (Add Folder… / dropped folders) and auto-exports the CSV into each touched folder root only when every image under that root has metadata (all-or-nothing, incl. across retry runs); file-only batches keep the manual flow until an export folder was chosen in Review & Export |
+| `app/ui/metadata_review.py` | Final review step: read-only table of every row, warnings (missing titles, non-embeddable formats), explicit export choices (CSV path; embed into copies vs in place) |
+
+### 14.3 UI behaviour
+
+- Grid tiles are colour-coded: grey = pending, yellow = generating, green =
+  done, red = failed (error text in the tooltip and the status line).
+- Every generated field is editable at any time; edits persist into the row
+  model and are what gets exported (generation results never auto-overwrite
+  manual edits mid-run for the item being edited).
+- `Generate Metadata` (re)processes **every** pending + failed item in the
+  queue (folders are scanned recursively); completed rows are left untouched
+  unless the user selects them and presses `Regenerate Selected`.
+- While a batch runs the status line shows `Processing image 3 of 10 — name`,
+  the progress bar counts done/total, and all start buttons are disabled (a
+  programmatic re-start is refused with a log line, never a second worker).
+- Failed rows are listed by name in the log at the end of the run; `Retry
+  Failed` re-runs only those items.
+- A **folder-based** batch auto-exports `metadata.csv` into the selected
+  folder (`metadata_2.csv`, … if one exists — existing files are never
+  overwritten) **only when every image in that folder batch has successfully
+  generated metadata**. If any image fails or the batch is cancelled, no CSV
+  is written; successful rows and failed-image statuses stay visible in the
+  list so `Retry Failed` can re-run only the failures, and once all images
+  succeed the complete CSV is saved automatically. **File-only** batches keep
+  the manual Review & Export flow and auto-export only after an export folder
+  was chosen there once.
+- Embedding always remains behind the review dialog — in-file rewrites never
+  happen automatically.
+
+### 14.4 Testing
+
+`tests/metadata_test.py` (standalone script, no model, no network, no API key):
+JSON parsing/sanitising, in-memory pre-flight (RGBA flatten + ≤1024 px,
+disk file byte-identical afterwards), CSV content, PNG/JPEG embed round-trips
+(in place and copy mode, temp-file hygiene, unsupported-format error),
+credential lookup order, transient/permanent classification incl. the Gemini
+retirement hint, the worker with a stubbed provider, an offscreen smoke
+build of the shell with both pages, and a full page-level batch run (folder
+of 4 images incl. a subfolder, one stubbed failure): every image generated
+with its own metadata, per-image failure reported, a partially failed folder
+batch provably writing no CSV, the fully successful retry exporting the
+complete CSV without overwriting a pre-existing one, and file-only batches
+provably skipping the auto-export.
+
+---
+
+## 15. License & Credits
 
 - **Real-ESRGAN** is by Xintao Wang et al. ([xinntao/Real-ESRGAN], **BSD-3-Clause**).
   This project reuses the public pretrained `x4plus` weights and re-implements the
