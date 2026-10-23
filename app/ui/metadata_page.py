@@ -3,8 +3,10 @@
 The user upscales and saves images first, then opens this screen and picks
 the saved images or folder. Every image gets a preview tile, a per-image
 status and editable title/description/keywords before the final review-and-
-export step. Providers: Gemini or Groq, with the API key handled through
-app.engine.credential_store (session → env var → Windows Credential Manager).
+export step. Providers: Gemini, Groq, or Ollama (either the user's own local
+server or Ollama's hosted cloud API). Hosted keys go through
+app.engine.credential_store (session → env var → Windows Credential Manager);
+local Ollama needs no key at all and never uploads anything.
 """
 
 from __future__ import annotations
@@ -37,10 +39,13 @@ from PySide6.QtWidgets import (
 from app.engine import credential_store
 from app.engine.metadata_settings import (
     MetadataSettings, ImageMetadata, SUPPORTED_PROVIDERS, DEFAULT_MODELS,
-    GEMINI_MODELS, GROQ_MODELS, LANGUAGES, ADOBE_KEYWORDS_MAX, ADOBE_TITLE_MAX,
+    MODEL_CATALOGUES, API_KEY_ENV_VARS, LANGUAGES, ADOBE_KEYWORDS_MAX,
+    ADOBE_TITLE_MAX, KEYWORD_COUNT_DEFAULT, OLLAMA_KEYWORD_COUNT,
+    OLLAMA_LOCAL, OLLAMA_CLOUD, OLLAMA_LOCAL_URL, OLLAMA_CLOUD_URL,
+    is_ollama, provider_requires_key,
 )
 from app.engine.metadata_export import write_csv, embed_metadata, EMBEDDABLE_SUFFIXES
-from app.engine.metadata_worker import MetadataWorker
+from app.engine.metadata_worker import MetadataWorker, OllamaLookupWorker
 from app.engine.worker import IMAGE_EXTENSIONS, collect_images
 
 from app.ui.metadata_review import ReviewDialog
@@ -71,7 +76,12 @@ class MetadataPage(QWidget):
         super().__init__(parent)
         self.items: dict[str, MetaItem] = {}   # key: resolved path, lowercased
         self.worker: MetadataWorker | None = None
+        self.lookup: OllamaLookupWorker | None = None   # Ollama check thread
+        self._lookup_provider = ""     # which provider the running check belongs to
         self._loading_editor = False
+        # Keyword count remembered while the user visits the Ollama modes, whose
+        # target is a full Adobe set (exactly 50) instead of "up to 45".
+        self._keyword_pref = KEYWORD_COUNT_DEFAULT
         # Folder selections are remembered so a finished folder batch can
         # auto-export its CSV back into the folder the user picked; batches
         # started from individual files keep the manual export workflow.
@@ -150,8 +160,34 @@ class MetadataPage(QWidget):
         model_row.addWidget(self.model_combo, 1)
         form.addLayout(model_row)
 
-        # API key
-        form.addWidget(QLabel("API key:"))
+        # Ollama-only controls: server address (local), the connection/model
+        # availability check, and a plain statement of where the image goes.
+        self.ollama_box = QWidget()
+        ol = QVBoxLayout(self.ollama_box)
+        ol.setContentsMargins(0, 0, 0, 0)
+        self.ollama_url_widget = QWidget()
+        url_row = QHBoxLayout(self.ollama_url_widget)
+        url_row.setContentsMargins(0, 0, 0, 0)
+        url_row.addWidget(QLabel("Ollama server:"))
+        self.ollama_url_edit = QLineEdit(OLLAMA_LOCAL_URL)
+        self.ollama_url_edit.setToolTip(
+            "Address of the Ollama API on this computer (or another machine "
+            f"running Ollama). Default: {OLLAMA_LOCAL_URL}")
+        url_row.addWidget(self.ollama_url_edit, 1)
+        ol.addWidget(self.ollama_url_widget)
+        self.btn_ollama_check = QPushButton("Check Connection & Vision Models")
+        self.btn_ollama_check.clicked.connect(self.check_ollama)
+        ol.addWidget(self.btn_ollama_check)
+        self.ollama_notice = QLabel("")
+        self.ollama_notice.setWordWrap(True)
+        ol.addWidget(self.ollama_notice)
+        form.addWidget(self.ollama_box)
+
+        # API key (hosted providers only — local Ollama never needs one).
+        self.key_box = QWidget()
+        key_lay = QVBoxLayout(self.key_box)
+        key_lay.setContentsMargins(0, 0, 0, 0)
+        key_lay.addWidget(QLabel("API key:"))
         key_row = QHBoxLayout()
         self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.Password)
@@ -165,7 +201,7 @@ class MetadataPage(QWidget):
             lambda v: self.btn_show_key.setText("Hide" if v else "Show"))
         key_row.addWidget(self.key_edit, 1)
         key_row.addWidget(self.btn_show_key)
-        form.addLayout(key_row)
+        key_lay.addLayout(key_row)
 
         remember_row = QHBoxLayout()
         self.chk_remember = QCheckBox("Remember key in Windows Credential Manager")
@@ -173,10 +209,11 @@ class MetadataPage(QWidget):
         self.btn_forget.clicked.connect(self.forget_key)
         remember_row.addWidget(self.chk_remember, 1)
         remember_row.addWidget(self.btn_forget)
-        form.addLayout(remember_row)
+        key_lay.addLayout(remember_row)
         self.key_hint = QLabel("")
         self.key_hint.setWordWrap(True)
-        form.addWidget(self.key_hint)
+        key_lay.addWidget(self.key_hint)
+        form.addWidget(self.key_box)
 
         # Language + keyword count
         lang_row = QHBoxLayout()
@@ -188,9 +225,11 @@ class MetadataPage(QWidget):
         lang_row.addWidget(QLabel("Keywords:"))
         self.keywords_spin = QSpinBox()
         self.keywords_spin.setRange(1, ADOBE_KEYWORDS_MAX)
-        self.keywords_spin.setValue(45)
+        self.keywords_spin.setValue(KEYWORD_COUNT_DEFAULT)
         self.keywords_spin.setToolTip(
-            f"Maximum keywords kept per image (Adobe Stock allows {ADOBE_KEYWORDS_MAX + 1}).")
+            f"Keywords kept per image (Adobe Stock allows {ADOBE_KEYWORDS_MAX} "
+            "at most). Ollama modes ask for exactly this many.")
+        self.keywords_spin.valueChanged.connect(self._on_keyword_count_changed)
         lang_row.addWidget(self.keywords_spin)
         form.addLayout(lang_row)
 
@@ -264,32 +303,64 @@ class MetadataPage(QWidget):
 
     # -- provider / key handling -------------------------------------------------
     def _on_provider_changed(self, provider: str) -> None:
-        models = GEMINI_MODELS if provider == "Gemini" else GROQ_MODELS
         self.model_combo.clear()
-        self.model_combo.addItems(models)
-        self.model_combo.setCurrentText(DEFAULT_MODELS[provider])
-        env_var = "GEMINI_API_KEY" if provider == "Gemini" else "GROQ_API_KEY"
+        self.model_combo.addItems(list(MODEL_CATALOGUES.get(provider, [])))
+        self.model_combo.setCurrentText(DEFAULT_MODELS.get(provider, ""))
+        ollama = is_ollama(provider)
+        cloud = provider == OLLAMA_CLOUD
+        self.ollama_box.setVisible(ollama)
+        self.ollama_url_widget.setVisible(ollama and not cloud)
+        self.key_box.setVisible(not ollama or cloud)
+        if ollama:
+            # Ollama aims at a complete Adobe keyword set; the hosted providers
+            # go back to whatever the user had chosen before.
+            self.keywords_spin.setValue(OLLAMA_KEYWORD_COUNT)
+            self.ollama_notice.setText(
+                "☁ Ollama Cloud is a hosted service: every image is uploaded to "
+                f"{OLLAMA_CLOUD_URL} for analysis, and which models work depends "
+                "on your account and plan. Keys are stored in the Windows "
+                "Credential Manager (or the OLLAMA_API_KEY environment variable)."
+                if cloud else
+                "⛁ Local Ollama: images are only sent to the Ollama server on "
+                "your computer and never leave it. No API key is needed — press "
+                "the button above to see your installed image-capable models.")
+        else:
+            self.keywords_spin.setValue(min(self._keyword_pref,
+                                            ADOBE_KEYWORDS_MAX))
+        env_var = API_KEY_ENV_VARS.get(provider, "")
         self.key_edit.setPlaceholderText(f"or set {env_var}, or a saved key")
         self._update_key_hint()
 
+    def _on_keyword_count_changed(self, value: int) -> None:
+        """Remember the user's target for the hosted providers. The Ollama modes
+        always aim for a full Adobe set, so their value is not carried over."""
+        if not is_ollama(self.provider_combo.currentText()):
+            self._keyword_pref = value
+
     def _update_key_hint(self) -> None:
         provider = self.provider_combo.currentText()
-        if self.key_edit.text().strip():
+        if not provider_requires_key(provider):
+            self.key_hint.setText("✓ Local Ollama needs no key — nothing is "
+                                  "stored or uploaded.")
+        elif self.key_edit.text().strip():
             self.key_hint.setText("✓ Key typed in — used for this run only unless "
                                   '"Remember" is ticked at generation time.')
         elif credential_store.get_key(provider):
             self.key_hint.setText(
                 f"✓ A key for {provider} was found (typed earlier, "
-                f"{provider.upper()}_API_KEY env var, or Windows Credential Manager).")
+                f"{API_KEY_ENV_VARS.get(provider, '')} env var, or Windows "
+                "Credential Manager).")
         else:
             self.key_hint.setText(
                 f"✗ No {provider} key configured. Enter one above, set the "
-                f"{provider.upper()}_API_KEY environment variable, or save it "
-                "via Windows Credential Manager.")
+                f"{API_KEY_ENV_VARS.get(provider, '')} environment variable, or "
+                "save it via Windows Credential Manager.")
 
     def _resolve_api_key(self) -> str:
         """Pick the key for the current provider and remember it if asked."""
         provider = self.provider_combo.currentText()
+        if not provider_requires_key(provider):
+            return ""          # local Ollama: never store, never require a key
         typed = self.key_edit.text().strip()
         if typed:
             credential_store.set_session_key(provider, typed)
@@ -305,6 +376,52 @@ class MetadataPage(QWidget):
         self.key_edit.clear()
         self.log.appendPlainText(("✓ " if ok else "✗ ") + msg)
         self._update_key_hint()
+
+    # -- Ollama connection / model availability ----------------------------------
+    def check_ollama(self) -> None:
+        """Ask the selected Ollama mode what it is and which models take images."""
+        provider = self.provider_combo.currentText()
+        if not is_ollama(provider):
+            return
+        if self.lookup is not None and self.lookup.isRunning():
+            self.log.appendPlainText("An Ollama check is already running.")
+            return
+        cloud = provider == OLLAMA_CLOUD
+        base = OLLAMA_CLOUD_URL if cloud else self.ollama_url_edit.text()
+        key = self._resolve_api_key() if cloud else ""
+        self.btn_ollama_check.setEnabled(False)
+        self.status_label.setText(f"Checking {provider}…")
+        self.log.appendPlainText(
+            f"Checking {provider} at {base} for image-capable models…")
+        self.lookup = OllamaLookupWorker(base, key, cloud)
+        self._lookup_provider = provider
+        self.lookup.log_message.connect(self.log.appendPlainText)
+        self.lookup.result.connect(self._on_lookup_result)
+        self.lookup.start()
+
+    def _on_lookup_result(self, models: list, message: str) -> None:
+        provider = self.provider_combo.currentText()
+        self.btn_ollama_check.setEnabled(not self.worker_running())
+        self.status_label.setText(f"{len(self.items)} image(s) in list")
+        self.log.appendPlainText(message)
+        if provider != self._lookup_provider:
+            self.log.appendPlainText(
+                f"Result was for {self._lookup_provider}; you already switched "
+                "providers, so the model list was left alone.")
+            return
+        if not models:
+            return
+        self.model_combo.clear()
+        self.model_combo.addItems(models)
+        self.model_combo.setCurrentText(models[0])
+        found = f"✓ {len(models)} image-capable model(s) ready to use."
+        if provider == OLLAMA_CLOUD:
+            found += (" These are the models this account can reach now; cloud "
+                      "requests upload the image to " + OLLAMA_CLOUD_URL + ".")
+        else:
+            found += (" Only models installed on this machine are listed — "
+                      "images stay local.")
+        self.ollama_notice.setText(found)
 
     # -- queue management -------------------------------------------------------
     def _key(self, path: Path) -> str:
@@ -426,7 +543,15 @@ class MetadataPage(QWidget):
     # -- editor ------------------------------------------------------------------
     def _on_item_selected(self, current: QListWidgetItem | None,
                           previous: QListWidgetItem | None) -> None:
-        self._commit_editor()
+        # Commit against the item being LEFT: by the time this signal fires the
+        # grid's current item is already the new one, so a plain
+        # _commit_editor() would paste the previous image's text over the newly
+        # selected image's generated metadata.
+        if previous is not None:
+            try:
+                self._commit_editor(previous)
+            except RuntimeError:      # item already destroyed (grid cleared)
+                pass
         self._show_item(current)
 
     def _grid_item(self, key: str) -> QListWidgetItem | None:
@@ -456,11 +581,17 @@ class MetadataPage(QWidget):
         self._loading_editor = False
         self._update_title_count()
 
-    def _commit_editor(self) -> None:
-        """Write the visible editor fields back into the selected item."""
+    def _commit_editor(self, target=None) -> None:
+        """Write the visible editor fields back into the selected item.
+
+        ``target`` lets the selection-change handler name the item that is
+        being left. The ``textChanged`` slots hand us the new text instead, so
+        anything that is not a grid item means "use the current selection".
+        """
         if self._loading_editor:
             return
-        grid_item = self.grid.currentItem()
+        grid_item = (target if isinstance(target, QListWidgetItem)
+                     else self.grid.currentItem())
         if grid_item is None:
             return
         meta_item = self.items.get(grid_item.data(Qt.UserRole + 1))
@@ -511,14 +642,22 @@ class MetadataPage(QWidget):
             self._show_item(grid_item)
 
     # -- generation --------------------------------------------------------------
+    def worker_running(self) -> bool:
+        """True while a metadata batch owns the screen's controls."""
+        return bool(self.worker and self.worker.isRunning())
+
     def _build_settings(self) -> MetadataSettings:
+        provider = self.provider_combo.currentText()
         return MetadataSettings(
-            provider=self.provider_combo.currentText(),
-            model=self.model_combo.currentText().strip() or DEFAULT_MODELS[
-                self.provider_combo.currentText()],
+            provider=provider,
+            model=self.model_combo.currentText().strip() or DEFAULT_MODELS.get(
+                provider, ""),
             language=self.language_combo.currentText().strip() or "English",
             keyword_count=self.keywords_spin.value(),
             generate_description=self.chk_description.isChecked(),
+            ollama_url=self.ollama_url_edit.text().strip() or OLLAMA_LOCAL_URL,
+            # Ollama fills the Adobe keyword slots instead of leaving one spare.
+            exact_keyword_count=is_ollama(provider),
         )
 
     def _start_generation(self, keys: list[str], what: str) -> None:
@@ -532,14 +671,22 @@ class MetadataPage(QWidget):
         if not keys:
             QMessageBox.information(self, "Nothing to do", f"No {what} images in the list.")
             return
+        provider = self.provider_combo.currentText()
         api_key = self._resolve_api_key()
-        if not api_key:
+        if provider_requires_key(provider) and not api_key:
             QMessageBox.warning(
                 self, "Missing API key",
-                f"No {self.provider_combo.currentText()} API key is configured.\n\n"
+                f"No {provider} API key is configured.\n\n"
                 "Enter one in the key field, or set the "
-                f"{self.provider_combo.currentText().upper()}_API_KEY environment variable.")
+                f"{API_KEY_ENV_VARS.get(provider, '')} environment variable.")
             self._update_key_hint()
+            return
+        if is_ollama(provider) and not self.model_combo.currentText().strip():
+            QMessageBox.warning(
+                self, "No Ollama model selected",
+                f"{provider} needs a model that can analyse images.\n\n"
+                "Press “Check Connection & Vision Models” to list the "
+                "image-capable ones, or type a model name you know works.")
             return
         files = [self.items[k].path for k in keys]
         # State for the auto CSV export in _on_finished: which items this run
@@ -686,7 +833,8 @@ class MetadataPage(QWidget):
         self.cancel_btn.setEnabled(running)
         for w in (self.provider_combo, self.model_combo, self.key_edit,
                   self.chk_remember, self.btn_forget, self.language_combo,
-                  self.keywords_spin, self.chk_description):
+                  self.keywords_spin, self.chk_description,
+                  self.ollama_url_edit, self.btn_ollama_check):
             w.setEnabled(not running)
 
     # -- review & export ----------------------------------------------------------
@@ -762,3 +910,10 @@ class MetadataPage(QWidget):
         if self.worker and self.worker.isRunning():
             self.worker.request_cancel()
             self.worker.wait(3000)
+        if self.lookup and self.lookup.isRunning():
+            # Destroying a running QThread is never safe, so ask the check to
+            # stop and wait it out — every HTTP call has its own timeout, so
+            # this can only last as long as one in-flight request.
+            self.lookup.request_stop()
+            if not self.lookup.wait(5000):
+                self.lookup.wait()

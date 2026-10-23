@@ -11,9 +11,15 @@ when the first pass ends with images that failed for temporary reasons
 metadata is kept and ONLY the retryable images are re-run after an
 increasing pause, up to ``MAX_BATCH_PASSES`` passes in total — the user
 never has to click "Retry Failed" for those. Permanent problems (bad API
-key, unsupported image, retired model) are reported immediately and are
-never retried. Images still failing after the last automatic pass stay
-marked failed so the existing manual "Retry Failed" action picks them up.
+key, unsupported image, retired model, an Ollama server that is not
+running) are reported immediately and are never retried. Images still
+failing after the last automatic pass stay marked failed so the existing
+manual "Retry Failed" action picks them up.
+
+``OllamaLookupWorker`` is the small companion thread behind the Metadata
+screen's connection/model check: it asks an Ollama server (local or
+ollama.com) which models exist and which of them can analyse images, so the
+UI never blocks on HTTP.
 """
 
 from __future__ import annotations
@@ -23,8 +29,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from .metadata_settings import MetadataSettings
-from .metadata_providers import generate_metadata, is_retryable_error
+from .metadata_settings import MetadataSettings, OLLAMA_CLOUD, OLLAMA_LOCAL
+from .metadata_providers import check_ollama, generate_metadata, is_retryable_error
 
 # Whole-batch automatic passes: the first run plus two retry passes.
 MAX_BATCH_PASSES = 3
@@ -79,6 +85,14 @@ class MetadataWorker(QThread):
         self.log_message.emit(
             f"Generating metadata for {total} image(s) with {self.settings.provider} "
             f"({self.settings.model}, {self.settings.language})…")
+        if self.settings.provider == OLLAMA_CLOUD:
+            self.log_message.emit(
+                "☁ Ollama Cloud is a hosted service — each image is uploaded "
+                "to https://ollama.com for analysis.")
+        elif self.settings.provider == OLLAMA_LOCAL:
+            self.log_message.emit(
+                f"⛁ Local Ollama at {self.settings.ollama_url}: images are only "
+                "read on this computer and never uploaded.")
         items = list(self.files)
         cancelled = False
         for pass_no in range(1, MAX_BATCH_PASSES + 1):
@@ -146,3 +160,39 @@ class MetadataWorker(QThread):
             self.log_message.emit(
                 f"Metadata generation complete — {succeeded} ok, {failed} failed.")
         self.finished_all.emit(succeeded, failed)
+
+
+class OllamaLookupWorker(QThread):
+    """Runs the Ollama connection/vision-model check off the UI thread.
+
+    Emits ``result(models, message)`` exactly once — an unreachable server,
+    a rejected cloud key or a model-less install all come back as an empty
+    list with an explained message, never as an exception in the UI.
+    """
+
+    log_message = Signal(str)
+    result = Signal(list, str)          # (vision models, outcome message)
+
+    def __init__(self, base_url: str, api_key: str = "", cloud: bool = False) -> None:
+        super().__init__()
+        self.base_url = base_url
+        self.api_key = api_key
+        self.cloud = cloud
+        self._stop = False
+
+    def request_stop(self) -> None:
+        """Skip the remaining per-model lookups (a close/cancel request)."""
+        self._stop = True
+
+    def stopped(self) -> bool:
+        return self._stop
+
+    def run(self) -> None:  # noqa: D102 (QThread entry point)
+        try:
+            models, message = check_ollama(self.base_url, self.api_key,
+                                           cloud=self.cloud,
+                                           log=self.log_message.emit,
+                                           stopped=self.stopped)
+        except Exception as exc:      # missing deps, unexpected SDK faults
+            models, message = [], f"Ollama check failed: {exc}"
+        self.result.emit(models, message)

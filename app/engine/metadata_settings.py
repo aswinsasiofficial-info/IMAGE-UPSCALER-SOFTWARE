@@ -11,11 +11,19 @@ from dataclasses import dataclass, field
 
 # Adobe Stock contributor limits (used to clamp generated text).
 ADOBE_TITLE_MAX = 70
-ADOBE_KEYWORDS_MAX = 49          # Adobe allows 50; keep one slot spare for edits
+ADOBE_KEYWORDS_MAX = 50          # Adobe's hard cap — the UI never offers more
 ADOBE_KEYWORD_MAX = 40
 ADOBE_DESCRIPTION_MAX = 2000
 
-SUPPORTED_PROVIDERS = ("Gemini", "Groq")
+OLLAMA_LOCAL = "Ollama (Local)"
+OLLAMA_CLOUD = "Ollama Cloud"
+SUPPORTED_PROVIDERS = ("Gemini", "Groq", OLLAMA_LOCAL, OLLAMA_CLOUD)
+
+# Ollama connection endpoints (verified against docs.ollama.com):
+#  * local API  — http://127.0.0.1:11434, no authentication, images stay local
+#  * cloud API  — https://ollama.com/api, Bearer API key, images are uploaded
+OLLAMA_LOCAL_URL = "http://localhost:11434"
+OLLAMA_CLOUD_URL = "https://ollama.com"
 
 # Model catalogues — combos in the UI are editable so future retirements can be
 # handled without a code change (a 404 from the API names the replacement).
@@ -34,7 +42,69 @@ GEMINI_MODELS = [
 GROQ_MODELS = [
     "qwen/qwen3.8-27b",
 ]
-DEFAULT_MODELS = {"Gemini": GEMINI_MODELS[0], "Groq": GROQ_MODELS[0]}
+# Ollama ships hundreds of models with per-account availability differences, so
+# nothing is assumed here: the Metadata screen queries the server itself
+# (``/api/tags`` — and ``/api/show`` capabilities on older local servers) and
+# lists only models that report the ``vision`` capability. The entries below are
+# the names Ollama's own documentation/API report as image-capable, offered as a
+# starting point before the availability check has been run.
+OLLAMA_LOCAL_MODELS = [
+    "gemma4",
+    "gemma3",
+    "llama3.2-vision",
+    "qwen3-vl",
+    "llava",
+]
+# Cloud IDs are size-qualified and account/plan dependent, so the check refreshes
+# this list from https://ollama.com/api/tags for the signed-in account. Every
+# name below reported the ``vision`` capability on Ollama's cloud model list when
+# this feature was built; treat them as a starting point, not a guarantee.
+OLLAMA_CLOUD_MODELS = [
+    "gemma4:31b",
+    "kimi-k2.6",
+    "minimax-m3",
+    "mistral-large-4",
+]
+
+DEFAULT_MODELS = {
+    "Gemini": GEMINI_MODELS[0],
+    "Groq": GROQ_MODELS[0],
+    OLLAMA_LOCAL: OLLAMA_LOCAL_MODELS[0],
+    OLLAMA_CLOUD: OLLAMA_CLOUD_MODELS[0],
+}
+
+# Every provider's known vision models — used for the UI combos and to detect a
+# model ID that clearly belongs to a different provider.
+MODEL_CATALOGUES = {
+    "Gemini": GEMINI_MODELS,
+    "Groq": GROQ_MODELS,
+    OLLAMA_LOCAL: OLLAMA_LOCAL_MODELS,
+    OLLAMA_CLOUD: OLLAMA_CLOUD_MODELS,
+}
+
+KEYWORD_COUNT_DEFAULT = 45       # Gemini/Groq: leave Adobe's last slot free
+OLLAMA_KEYWORD_COUNT = ADOBE_KEYWORDS_MAX   # Ollama: a full Adobe set (50)
+
+# Provider families that talk to the Ollama API (local server or hosted cloud).
+OLLAMA_PROVIDERS = (OLLAMA_LOCAL, OLLAMA_CLOUD)
+
+# Environment variable named in every "missing key" message and consulted by
+# credential_store. Local Ollama is absent on purpose: it needs no credential.
+API_KEY_ENV_VARS = {
+    "Gemini": "GEMINI_API_KEY",
+    "Groq": "GROQ_API_KEY",
+    OLLAMA_CLOUD: "OLLAMA_API_KEY",
+}
+
+
+def is_ollama(provider: str) -> bool:
+    return provider in OLLAMA_PROVIDERS
+
+
+def provider_requires_key(provider: str) -> bool:
+    """Local Ollama runs on the user's own machine and needs no credentials."""
+    return not is_ollama(provider) or provider == OLLAMA_CLOUD
+
 
 LANGUAGES = [
     "English", "Spanish", "French", "German", "Italian", "Portuguese",
@@ -49,11 +119,16 @@ ANALYSIS_MAX_EDGE = 1024
 @dataclass
 class MetadataSettings:
     """User-configurable options for the Metadata Generator screen."""
-    provider: str = "Gemini"           # "Gemini" | "Groq"
+    provider: str = "Gemini"           # see SUPPORTED_PROVIDERS
     model: str = DEFAULT_MODELS["Gemini"]
     language: str = "English"
     keyword_count: int = 45            # target number of keywords to produce
     generate_description: bool = True
+    # Ollama only: base URL of the local server (cloud mode always uses
+    # OLLAMA_CLOUD_URL) and the Adobe-complete keyword target ("exactly N"
+    # instead of "up to N").
+    ollama_url: str = OLLAMA_LOCAL_URL
+    exact_keyword_count: bool = False
 
 
 @dataclass
@@ -122,6 +197,7 @@ def sanitize_metadata(meta: ImageMetadata, settings: MetadataSettings) -> ImageM
 def build_prompt(settings: MetadataSettings) -> str:
     """Instruction sent alongside each image to the model."""
     n = min(settings.keyword_count, ADOBE_KEYWORDS_MAX)
+    quantity = "exactly" if settings.exact_keyword_count else "up to"
     desc_line = (
         f"- description: a natural, factual sentence or two (max {ADOBE_DESCRIPTION_MAX} characters)"
         if settings.generate_description
@@ -134,7 +210,7 @@ def build_prompt(settings: MetadataSettings) -> str:
         '{"title": "...", "description": "...", "keywords": ["..."]}\n'
         f"- title: max {ADOBE_TITLE_MAX} characters, descriptive, no punctuation at the end\n"
         f"{desc_line}\n"
-        f"- keywords: up to {n} single words or short phrases, most important first, "
+        f"- keywords: {quantity} {n} single words or short phrases, most important first, "
         "no duplicates, no trademarks or artist names\n"
     )
 
@@ -150,7 +226,9 @@ def parse_model_json(text: str, settings: MetadataSettings) -> ImageMetadata:
     cleaned = re.sub(r"```(?:json)?|```", "", text or "").strip()
     start, end = cleaned.find("{"), cleaned.rfind("}")
     if start == -1 or end <= start:
-        raise ValueError(f"Model did not return a JSON object: {cleaned[:160]!r}")
+        raise ValueError(
+            "the model's answer contained no complete JSON object "
+            f"(truncated or extra-text reply): {cleaned[:160]!r}")
     payload = json.loads(cleaned[start:end + 1])
     meta = ImageMetadata(
         title=str(payload.get("title", "")),
@@ -160,8 +238,8 @@ def parse_model_json(text: str, settings: MetadataSettings) -> ImageMetadata:
     return sanitize_metadata(meta, settings)
 
 
-# Image formats both provider APIs accept inline. Anything else that PIL can
-# read (BMP, TIFF, GIF, …) is converted to JPEG — the most universally
+# Image formats every supported provider API accepts inline. Anything else that
+# PIL can read (BMP, TIFF, GIF, …) is converted to JPEG — the most universally
 # supported format. HEIC/HEIF need the optional pillow-heif plugin; without it
 # PIL cannot decode them and prepare_analysis_bytes reports that clearly.
 IMAGE_MIME_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}

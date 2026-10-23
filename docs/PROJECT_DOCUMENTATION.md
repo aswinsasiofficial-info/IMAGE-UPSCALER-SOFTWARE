@@ -11,8 +11,9 @@ crop-to-fill resize that never stretches the image.
 
 Since v1.4 the app also hosts a second, **completely independent** feature screen —
 the **Metadata Generator** (top navigation → *Metadata*) — which produces Adobe
-Stock–ready titles/descriptions/keywords for already-saved images using **Gemini** or
-**Groq**. See [Section 14 — Metadata Generator](#14-metadata-generator).
+Stock–ready titles/descriptions/keywords for already-saved images using **Gemini**,
+**Groq** or **Ollama** (a local server on the user's machine, or Ollama's hosted
+cloud API). See [Section 14 — Metadata Generator](#14-metadata-generator).
 
 > **Note on resampling:** the neural network's internal upsampling uses
 > **nearest-neighbor** (feature-space) and the alpha-channel resize uses
@@ -101,8 +102,8 @@ d:\Upscaler\
 │   │   ├── realesrgan_upscaler.py   # weights, tiled inference, image I/O
 │   │   ├── worker.py                # QThread batch runner (progress + cancel)
 │   │   ├── metadata_settings.py     # metadata dataclasses, Adobe limits, JSON parsing
-│   │   ├── metadata_providers.py    # Gemini + Groq callers (retry, backoff)
-│   │   ├── metadata_worker.py       # QThread metadata batch runner
+│   │   ├── metadata_providers.py    # Gemini/Groq/Ollama callers (retry, backoff)
+│   │   ├── metadata_worker.py       # QThread metadata batch + Ollama lookup
 │   │   ├── metadata_export.py       # contributor CSV + PNG/JPEG in-file embedder
 │   │   └── credential_store.py      # API keys: session → env → Windows keyring
 │   └── ui/
@@ -117,7 +118,8 @@ d:\Upscaler\
 │   ├── worker_batch_test.py         # BatchWorker path test (offscreen Qt)
 │   ├── target_size_test.py          # exact-target crop-to-fill + transparency test
 │   ├── folder_mode_test.py          # folder-mode scan/output-path test (no model)
-│   └── metadata_test.py             # metadata engine/worker/UI test (no network)
+│   ├── metadata_test.py             # metadata engine/worker/UI test (no network)
+│   └── ollama_test.py               # Ollama local+cloud provider/worker/UI test
 ├── setup.ps1                        # one-time environment installer
 ├── run.bat                          # double-click launcher
 ├── run.ps1                          # PowerShell launcher
@@ -264,7 +266,7 @@ The metadata modules are documented in [Section 14](#14-metadata-generator).
 | `Pillow` | `>=10.0` | Image decode/encode, EXIF transpose, alpha handling, resampling | |
 | `numpy` | `>=1.26` | Array conversion between PIL and tensors | |
 | `google-genai` | `>=1.0` | Gemini provider (Metadata screen) | **Optional** — only the metadata feature needs it |
-| `requests` | `>=2.31` | Groq provider via its OpenAI-compatible HTTPS API | **Optional** — normally already present |
+| `requests` | `>=2.31` | Groq (OpenAI-compatible API) **and both Ollama modes** (`/api/chat`, `/api/tags`, `/api/show`) | **Optional** — normally already present |
 | `keyring` | `>=25` | "Remember key" storage in Windows Credential Manager | **Optional** |
 
 The CUDA wheel set is a **~2.6 GB download** — expect several GB of free disk (~4 GB total).
@@ -748,10 +750,13 @@ upscaler never triggers metadata, and the metadata screen never loads torch.
 ```
 MetadataPage (app/ui/metadata_page.py)
   add images/folder → thumbnail grid (status-coloured tiles, per-image tooltip)
+  → (Ollama only) Check Connection & Vision Models →
+      OllamaLookupWorker (QThread) → GET /api/tags (+ /api/show per model)
+      → only models whose capabilities include "vision" fill the model box
   → MetadataWorker (QThread) loops over EVERY queued image:
       prepare_analysis_bytes()  in-memory ≤1024 px JPEG (file on disk untouched)
       build_prompt()            JSON contract + language + keyword budget
-      _call_gemini() | _call_groq()   provider dispatch, retry/backoff
+      _call_gemini() | _call_groq() | _call_ollama()   provider dispatch, retry/backoff
       parse_model_json() + sanitize_metadata()   Adobe limits enforced
   → item_done/item_failed → grid colour + editor panel (all fields editable)
   → folder batch where EVERY image succeeded → write_csv() auto-exports
@@ -768,12 +773,12 @@ MetadataPage (app/ui/metadata_page.py)
 
 | Module | Responsibility |
 |---|---|
-| `app/engine/metadata_settings.py` | `MetadataSettings` / `ImageMetadata` dataclasses; Adobe constants (title ≤ 70, keywords ≤ 49 kept of 50); prompt building; robust JSON extraction (`parse_model_json` sanitises fences/prose, dedups keywords); `prepare_analysis_bytes` |
-| `app/engine/metadata_providers.py` | `generate_metadata()` dispatches Gemini (official `google-genai` SDK) or Groq (OpenAI-compatible endpoint via `requests`). Retries transient errors (408/409/425/429/5xx) up to 3 attempts with exponential backoff; permanent errors surface immediately. SDK exceptions are **never reconstructed** — they are wrapped in `ProviderError(message, code)`. A Gemini 404 retirement message is parsed for the suggested replacement model and surfaced in the error text; model combos are editable so the user can switch without a code change |
-| `app/engine/metadata_worker.py` | `MetadataWorker(QThread)`: loops the whole queue sequentially; emits `item_started(path, index, total)`/`item_done`/`item_failed` keyed by **full path** (same-named files in different folders stay distinct), plus `progress`/`finished_all`/`cancel` semantics identical to `BatchWorker`. A per-image failure never aborts the batch |
+| `app/engine/metadata_settings.py` | `MetadataSettings` / `ImageMetadata` dataclasses; Adobe constants (title ≤ 70, **≤ 50 keywords**); the provider registry (`SUPPORTED_PROVIDERS` = Gemini, Groq, `Ollama (Local)`, `Ollama Cloud`) with per-provider vision model catalogues, default models, server URLs (`OLLAMA_LOCAL_URL` / `OLLAMA_CLOUD_URL`) and env-var names; `provider_requires_key()` (local Ollama is keyless by design); prompt building (`build_prompt` asks Ollama for **exactly** `ADOBE_KEYWORDS_MAX` keywords, hosted providers keep the "up to N" wording); robust JSON extraction (`parse_model_json` sanitises fences/prose, dedups keywords); `prepare_analysis_bytes` |
+| `app/engine/metadata_providers.py` | `generate_metadata()` dispatches Gemini (official `google-genai` SDK), Groq (OpenAI-compatible endpoint via `requests`) or Ollama — **both Ollama modes share `_call_ollama()`**, the official `POST /api/chat` with the image as base64 inside `messages[].images`, `stream: false`, `format: "json"` and `options` (temperature/num_predict). `ollama_base()` pins cloud to `https://ollama.com` (Bearer `OLLAMA_API_KEY`, upload) and honours a custom host for local mode (`http://localhost:11434`, no auth header, image never leaves the machine); local timeouts are 300 s so a CPU model can finish loading. `check_ollama()` performs the connection + availability check (`/api/tags`, plus `/api/show` capabilities on servers that do not report them) and returns only vision-capable models. Retries transient errors (408/409/425/429/5xx, timeouts, cloud network blips) up to 3 attempts with exponential backoff; permanent errors (bad key 401/402/403, missing/retired model 404, rejected image 400/413, **local server not running**, invalid settings) surface immediately. SDK exceptions are **never reconstructed** — they are wrapped in `ProviderError(message, code)`. A Gemini 404 retirement message is parsed for the suggested replacement model and surfaced in the error text; model combos are editable so the user can switch without a code change |
+| `app/engine/metadata_worker.py` | `MetadataWorker(QThread)`: loops the whole queue sequentially; emits `item_started(path, index, total)`/`item_done`/`item_failed` keyed by **full path** (same-named files in different folders stay distinct), plus `progress`/`finished_all`/`cancel` semantics identical to `BatchWorker`. A per-image failure never aborts the batch. Logs an explicit hosting notice per run (cloud = each image is uploaded to `https://ollama.com`; local = images stay on this computer). `OllamaLookupWorker(QThread)` runs the blocking connection/model check off the UI thread and reports back via `result(models, message)` |
 | `app/engine/metadata_export.py` | Contributor CSV (comma-joined keywords, `utf-8-sig` so Excel opens UTF-8) and in-file embedding: PNG `PngInfo` tEXt chunks, JPEG COM comment with a JSON payload (`quality="keep"` so pixels aren't re-degraded). Writes go to a temp file + `os.replace` so an in-place rewrite can never half-overwrite; non-PNG/JPEG raise a clear error |
-| `app/engine/credential_store.py` | API key resolution order: in-session (typed) → env var (`GEMINI_API_KEY` / `GROQ_API_KEY`) → Windows Credential Manager via `keyring`. Optional "Remember" persists to keyring; keys are never logged or exported |
-| `app/ui/metadata_page.py` | The screen: grid preview + provider/model/key/language/keyword-count options, editor panel for the selected tile, per-image status, **Generate Metadata / Retry Failed / Regenerate Selected**, and **Review & Export…**. Remembers folder selections (Add Folder… / dropped folders) and auto-exports the CSV into each touched folder root only when every image under that root has metadata (all-or-nothing, incl. across retry runs); file-only batches keep the manual flow until an export folder was chosen in Review & Export |
+| `app/engine/credential_store.py` | API key resolution order: in-session (typed) → env var (`GEMINI_API_KEY` / `GROQ_API_KEY` / `OLLAMA_API_KEY`) → Windows Credential Manager via `keyring`, one entry **per provider** so credentials never leak across providers. Optional "Remember" persists to keyring; keys are never logged or exported. Keyless providers (local Ollama) short-circuit: `get_key()` returns `""` and `save_key()` refuses, so no credential is ever required or stored for a local server |
+| `app/ui/metadata_page.py` | The screen: grid preview + provider/model/key/language/keyword-count options, editor panel for the selected tile, per-image status, **Generate Metadata / Retry Failed / Regenerate Selected**, and **Review & Export…**. Switching provider swaps the model catalogue, hides the key field for local Ollama, shows the server-address field + **Check Connection & Vision Models** button for both Ollama modes, and prints a plain-language notice about where images go (hosted upload vs local only); the check runs on `OllamaLookupWorker` and refills the editable model box with the image-capable models actually available. Remembers folder selections (Add Folder… / dropped folders) and auto-exports the CSV into each touched folder root only when every image under that root has metadata (all-or-nothing, incl. across retry runs); file-only batches keep the manual flow until an export folder was chosen in Review & Export |
 | `app/ui/metadata_review.py` | Final review step: read-only table of every row, warnings (missing titles, non-embeddable formats), explicit export choices (CSV path; embed into copies vs in place) |
 
 ### 14.3 UI behaviour
@@ -782,7 +787,17 @@ MetadataPage (app/ui/metadata_page.py)
   done, red = failed (error text in the tooltip and the status line).
 - Every generated field is editable at any time; edits persist into the row
   model and are what gets exported (generation results never auto-overwrite
-  manual edits mid-run for the item being edited).
+  manual edits mid-run for the item being edited). Selecting a different tile
+  commits the editor to the row being **left**, never the one being entered, so
+  no image can lose its metadata to the previously selected one.
+- Provider panel is mode-aware: Gemini/Groq/Ollama Cloud show the key field,
+  **Ollama (Local)** hides it entirely; both Ollama modes show the server
+  address (local only — the cloud host is fixed) and a notice spelling out
+  where images go, with the keyword count preset to a full Adobe set of 50.
+- **Check Connection & Vision Models** runs off the UI thread and only lists
+  models whose reported capabilities include `vision`; text-only models are
+  skipped and the log says how many, so a user can never pick a model that
+  cannot read the image.
 - `Generate Metadata` (re)processes **every** pending + failed item in the
   queue (folders are scanned recursively); completed rows are left untouched
   unless the user selects them and presses `Regenerate Selected`.
@@ -803,20 +818,98 @@ MetadataPage (app/ui/metadata_page.py)
 - Embedding always remains behind the review dialog — in-file rewrites never
   happen automatically.
 
-### 14.4 Testing
+### 14.4 Ollama modes — setup and limits
+
+| | **Ollama (Local)** | **Ollama Cloud** |
+|---|---|---|
+| Endpoint | `http://localhost:11434` (editable, e.g. another LAN host) | `https://ollama.com` (fixed; a typed address is ignored in this mode) |
+| Credential | **None** — the screen hides the key field and `credential_store` refuses to store a key | Bearer key from <https://ollama.com/settings/keys>, typed (session) or via `OLLAMA_API_KEY` / Windows Credential Manager |
+| Image handling | Base64 image is sent to the local server only; nothing is uploaded to any third party | **Every image is uploaded to Ollama's hosted service** — labelled in the notice, the log line of each run and the error messages |
+| Model list | `GET /api/tags` + `POST /api/show` capabilities → only installed models reporting `vision` | `GET /api/tags` (authorized) → `capabilities` per model for **this account** |
+| Temporary failures | request timeouts (model still loading), 5xx/429, and a reply that holds no complete JSON object (truncated answer, stray prose) → retried | network blips, 5xx/429, truncated-JSON reply → retried |
+| Permanent failures (never retried) | server not running, model missing (404), rejected image (400/413), invalid server address, a model that answers with no visible text | invalid/rejected key (401/403), account without access or credits (402), model unavailable (404) |
+| Limits to expect | Needs the model in RAM/VRAM: a 4–12 B vision model is usable on 16 GB RAM but slow on CPU (minutes for the first image, then cached); a GPU makes it interactive | Availability, throughput and price depend on the account's plan — not free by default, and not every account can reach every model; 120 s request timeout |
+
+Request shape (both modes, `POST <base>/api/chat`): one user message with the
+prepared image as a base64 string in `images`, `stream: false`,
+`format: "json"`, `options.num_predict: 3072` (a 50-keyword Adobe set plus a
+description is a long answer — too small a budget cuts the JSON off mid-list)
+and **`think: false`**, because on a reasoning model the hidden chain of thought
+otherwise consumes the whole budget and `message.content` comes back empty
+(observed against a real local `qwen3.5` server). A server old enough to reject
+the unknown field is detected from its 400 and asked once more without it.
+Small local models also frequently answer with 40–45 of the 50 keywords asked
+for, so a shortfall of up to `_KEYWORD_TOP_UP_MAX` (12) triggers exactly one
+cheap follow-up that asks only for the missing ones; the merge is de-duplicated
+and a failing follow-up never discards the metadata that already arrived.
+
+Setup for local mode: install [Ollama](https://ollama.com/download), start it
+(`ollama serve` or the tray app), pull one image-capable model
+(`ollama pull gemma4`), then in *Metadata* choose **Ollama (Local)** and press
+**Check Connection & Vision Models**. Setup for cloud mode: create an API key on
+Ollama, choose **Ollama Cloud**, paste the key (tick *Remember* to keep it in the
+Windows Credential Manager) and run the same check to list what the account can
+actually reach.
+
+The hard-coded model names (`OLLAMA_LOCAL_MODELS` / `OLLAMA_CLOUD_MODELS`) are
+only a starting point offered before that check has run: each was confirmed
+image-capable on Ollama's own model list when this feature was built, and no
+model is ever *assumed* usable — after **Check Connection & Vision Models** the
+combo is rebuilt from what the server reports for this machine or this account,
+so a pulled quantised tag (`gemma3:12b`) is kept exactly as installed while a
+name belonging to another provider is replaced by the provider default instead
+of guaranteeing a 404.
+
+### 14.5 Testing
 
 `tests/metadata_test.py` (standalone script, no model, no network, no API key):
 JSON parsing/sanitising, in-memory pre-flight (RGBA flatten + ≤1024 px,
 disk file byte-identical afterwards), CSV content, PNG/JPEG embed round-trips
 (in place and copy mode, temp-file hygiene, unsupported-format error),
 credential lookup order, transient/permanent classification incl. the Gemini
-retirement hint, the worker with a stubbed provider, an offscreen smoke
-build of the shell with both pages, and a full page-level batch run (folder
-of 4 images incl. a subfolder, one stubbed failure): every image generated
-with its own metadata, per-image failure reported, a partially failed folder
-batch provably writing no CSV, the fully successful retry exporting the
-complete CSV without overwriting a pre-existing one, and file-only batches
-provably skipping the auto-export.
+retirement hint, model-catalogues/foreign-model fallback, the Gemini and Groq
+request payloads, the worker with a stubbed provider, an offscreen smoke
+build of the shell with both pages, editor isolation across tile selection, and a
+full page-level batch run (folder of 4 images incl. a subfolder, one stubbed
+failure): every image generated with its own metadata, per-image failure
+reported, a partially failed folder batch provably writing no CSV, the fully
+successful retry exporting the complete CSV without overwriting a pre-existing
+one, and file-only batches provably skipping the auto-export.
+
+`tests/ollama_test.py` (standalone script, no Ollama install, no key, no
+network — every HTTP call is stubbed): the official local `POST /api/chat`
+payload (base64 image in `messages[].images`, `stream: false`, `format: "json"`,
+`think: false`, prompt as text, **no** `Authorization` header) and the cloud
+variant (host pinned to `https://ollama.com`, Bearer key, custom local address
+ignored, `gemma4:31b` style IDs); credential isolation (`OLLAMA_API_KEY` named
+only for cloud, local mode runs keyless and refuses to store a key); the
+"exactly 50 keywords" prompt target with Adobe clamping, plus the keyword
+top-up (a 45/50 answer gets **exactly one** follow-up naming only the missing
+count and never repeating what is already collected, a refused follow-up keeps
+the 45 good keywords, a reply with 1 keyword is not topped up); the empty-answer
+error (non-retryable, one call) and the older-server fallback (400 naming
+`think` → second request without the field); vision-model discovery
+(`/api/show` capabilities on a local server, `capabilities` straight from the
+cloud `/api/tags`, dead server, missing key, rejected key, text-only models, a
+stopped check issuing no further `/api/show` calls); model-selection rules
+(quantised local tags pass through, foreign IDs fall back); permanent failures
+asserted to issue **exactly one** HTTP call and to be reported as non-retryable
+(missing model 404, rejected image 400/413, cloud 401/402, local server down,
+invalid server address); transient failures retried with backoff and flagged
+retryable (503 → 429 → success, timeouts, a truncated JSON answer);
+`MetadataWorker` retention (a temporary failure regenerated on the later pass
+only, successful and permanent-failure images requested once, exactly one retry
+pass carrying only the failed item); and page-level checks that a local-Ollama
+folder batch starts with no key at all, writes **no** CSV while any image is
+still failed, exports the complete `metadata.csv` once `Retry Failed` makes the
+batch fully green, and keeps every generated row editable, while cloud mode
+shows the key field and the upload-the-image warning.
+
+Beyond the stubbed suite, the local path was also run against a real Ollama
+server on the development machine (vision check discovering `qwen3.5:4b` and
+skipping a text-only model; a two-image folder batch reaching 50 keywords per
+image and exporting `metadata.csv`). That check is manual — the automated tests
+never require Ollama to be installed.
 
 ---
 

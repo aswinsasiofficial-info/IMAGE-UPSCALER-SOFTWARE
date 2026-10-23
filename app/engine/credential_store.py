@@ -1,17 +1,22 @@
 """Secure API-key storage for the Metadata Generator.
 
 Lookup order per provider: in-session value → environment variable
-(``GEMINI_API_KEY`` / ``GROQ_API_KEY``) → Windows Credential Manager via
-``keyring``. Keys are never written to disk by the app itself, never logged,
-and never included in exported files.
+(``GEMINI_API_KEY`` / ``GROQ_API_KEY`` / ``OLLAMA_API_KEY``) → Windows
+Credential Manager via ``keyring``. Keys are never written to disk by the app
+itself, never logged, and never included in exported files.
+
+Local Ollama is deliberately absent from the table: it talks to a server on the
+user's own machine and must never require or store a credential.
 """
 
 from __future__ import annotations
 
 import os
 
+from .metadata_settings import API_KEY_ENV_VARS, provider_requires_key
+
 _KEYRING_SERVICE = "Upscaler-Metadata"
-_ENV_VARS = {"Gemini": "GEMINI_API_KEY", "Groq": "GROQ_API_KEY"}
+_ENV_VARS = API_KEY_ENV_VARS
 
 # Lives only as long as the process — filled from the UI's key field.
 _session_keys: dict[str, str] = {}
@@ -36,6 +41,8 @@ def set_session_key(provider: str, key: str) -> None:
 
 def get_key(provider: str) -> str:
     """Best available key for *provider* ("" when none is configured)."""
+    if not provider_requires_key(provider):
+        return ""          # local Ollama never uses or stores credentials
     if provider in _session_keys:
         return _session_keys[provider]
     env = os.environ.get(_ENV_VARS.get(provider, ""), "").strip()
@@ -53,6 +60,8 @@ def get_key(provider: str) -> str:
 def save_key(provider: str, key: str) -> tuple[bool, str]:
     """Persist *key* in Windows Credential Manager. Returns (ok, message)."""
     key = (key or "").strip()
+    if not provider_requires_key(provider):
+        return False, f"{provider} runs locally and needs no key to store."
     if not key:
         return False, "Nothing to save — the key field is empty."
     if not _keyring_available():

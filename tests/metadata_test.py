@@ -580,6 +580,40 @@ def test_ui_smoke(app: QApplication) -> None:
     print("  UI smoke OK")
 
 
+def test_editor_switch_keeps_metadata_per_item(app: QApplication) -> None:
+    """Selecting the next image must not paste the previous image's editor text
+    over the newly selected image's generated metadata."""
+    from app.ui.metadata_page import MetadataPage, DONE
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        a, b = root / "a.png", root / "b.png"
+        Image.new("RGB", (8, 8), (1, 1, 1)).save(a)
+        Image.new("RGB", (8, 8), (2, 2, 2)).save(b)
+        page = MetadataPage()
+        page._add_paths([a, b])
+        ka, kb = page._key(a), page._key(b)
+        page._set_status(ka, DONE, meta={"title": "Alpha", "description": "da",
+                                         "keywords": ["x"]})
+        page._set_status(kb, DONE, meta={"title": "Beta", "description": "db",
+                                         "keywords": ["y"]})
+
+        page.grid.setCurrentItem(page._grid_item(ka))
+        assert page.title_edit.text() == "Alpha", page.title_edit.text()
+        page.grid.setCurrentItem(page._grid_item(kb))
+        assert page.title_edit.text() == "Beta", page.title_edit.text()
+        assert page.items[ka].meta.title == "Alpha"
+        # Manual edits land on the image that is actually shown…
+        page.title_edit.setText("Beta edited")
+        assert page.items[kb].meta.title == "Beta edited"
+        # …and survive moving to another row.
+        page.grid.setCurrentItem(page._grid_item(ka))
+        assert page.items[kb].meta.title == "Beta edited"
+        assert page.items[ka].meta.title == "Alpha"
+        page.shutdown()
+    print("  editor per-item isolation OK")
+
+
 def test_page_batch_and_auto_csv(app: QApplication) -> None:
     """A folder batch auto-exports its CSV only when EVERY image succeeds; a
     batch with any failure writes nothing (successful/failed rows stay visible
@@ -757,6 +791,21 @@ def test_page_auto_retry_full_csv(app: QApplication) -> None:
     print("  page auto-retry + full CSV OK")
 
 
+def _release_qt(app: QApplication) -> None:
+    """Destroy leftover widgets/threads while QApplication is still alive.
+
+    Test pages are created without a parent, so without this their QThread and
+    widget objects are finalized only during interpreter shutdown — after
+    Qt/Shiboken state is gone, which crashes the process (access violation)
+    even though every assertion passed.
+    """
+    for w in list(app.topLevelWidgets()):
+        w.close()
+        w.deleteLater()
+    for _ in range(8):
+        app.processEvents()
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication([])
     with tempfile.TemporaryDirectory() as tmp:
@@ -777,13 +826,16 @@ def main() -> int:
             test_worker_auto_retry_passes(app)
             test_worker_cancel_stops_retries(app)
             test_ui_smoke(app)
+            test_editor_switch_keeps_metadata_per_item(app)
             test_page_batch_and_auto_csv(app)
             test_page_auto_retry_full_csv(app)
         except Exception as exc:
             import traceback
             traceback.print_exc()
             print(f"METADATA TEST FAILED: {exc}")
+            _release_qt(app)
             return 1
+    _release_qt(app)
     print("METADATA TEST PASSED")
     return 0
 

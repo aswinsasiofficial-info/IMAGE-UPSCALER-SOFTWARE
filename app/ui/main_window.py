@@ -102,7 +102,8 @@ class MainWindow(QMainWindow):
             self, "About",
             "<b>Batch Image Upscaler + Metadata Generator</b><br>"
             "Upscaler: Real-ESRGAN x4plus · PyTorch + CUDA · local 4x super-resolution.<br>"
-            "Metadata: Adobe-ready titles/descriptions/keywords via Gemini or Groq.<br><br>"
+            "Metadata: Adobe-ready titles/descriptions/keywords via Gemini, Groq "
+            "or Ollama (local server / hosted cloud).<br><br>"
             "The two features are independent: upscale and save first, then open "
             "Metadata and select the saved images or folder.")
 
