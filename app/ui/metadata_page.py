@@ -8,13 +8,14 @@ user's own local server or Ollama's hosted cloud API). Hosted keys go
 through app.engine.credential_store (session → env var → Windows Credential
 Manager); local Ollama needs no key at all and never uploads anything.
 
-Export writes the current metadata (including edits) to a CSV, asking where
-only the first time. Folder batches retry temporary failures automatically
-for the failed images only and save the complete CSV into the folder by
-themselves — but only once every image in the batch has metadata.
+A folder batch holds at most 25 images; a bigger folder opens a chooser.
+Temporary failures are retried automatically for the failed images only, and
+the folder's complete CSV is saved by itself once every image in the batch
+has metadata — never a partial one. Export writes the current metadata
+(including edits) to a CSV, asking where only the first time.
 
 Layout adapts to the window: three columns (images | editor | settings) when
-wide, images + tabs when medium, stacked when narrow.
+wide, images + tabs when narrower.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QRect, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPainterPath, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -44,10 +45,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QSplitter,
-    QStyle,
     QStyledItemDelegate,
     QTabWidget,
     QToolButton,
@@ -59,21 +58,26 @@ from app import design
 from app.engine import credential_store
 from app.engine.metadata_settings import (
     MetadataSettings, ImageMetadata, SUPPORTED_PROVIDERS, DEFAULT_MODELS,
-    MODEL_CATALOGUES, API_KEY_ENV_VARS, LANGUAGES, ADOBE_KEYWORDS_MAX,
+    MODEL_CATALOGUES, API_KEY_ENV_VARS, LANGUAGES, ADOBE_KEYWORDS_MAX, ADOBE_CATEGORIES,
     ADOBE_TITLE_MAX, ADOBE_DESCRIPTION_MAX, KEYWORD_COUNT_DEFAULT, OLLAMA_KEYWORD_COUNT,
     OLLAMA_LOCAL, OLLAMA_CLOUD, OLLAMA_LOCAL_URL, OLLAMA_CLOUD_URL,
-    is_ollama, provider_requires_key,
+    is_ollama, provider_requires_key, sanitize_keywords,
 )
 from app.engine.metadata_export import write_csv, embed_metadata, EMBEDDABLE_SUFFIXES
 from app.engine.metadata_worker import MetadataWorker, OllamaLookupWorker
-from app.engine.worker import IMAGE_EXTENSIONS, collect_images
+from app.imagefiles import discover, file_dialog_filter
 from app.ui import theme
+from app.ui.folder_picker import FolderPickDialog
+from app.ui.icons import icon, icon_button
 from app.ui.thumbnails import ImageLoader
+from app.ui.widgets import (Banner, ElidedLabel, Preview, card, label, paint_thumbnail,
+                            paint_tile_background)
 
 THUMB_EDGE = 128        # decoded thumbnail size (crisp at 200 % scaling)
 PREVIEW_EDGE = 900      # decoded size of the large preview
 WIDE_MIN = 1180         # three columns at or above this page width
 STACKED_MAX = 700       # list above details below this width (narrower than the window allows)
+FOLDER_BATCH_LIMIT = 25
 
 # Per-item generation states.
 PENDING, GENERATING, DONE, FAILED = "pending", "generating", "done", "failed"
@@ -92,23 +96,6 @@ class MetaItem:
     meta: ImageMetadata = field(default_factory=ImageMetadata)
 
 
-def _card(*, padding: int = 12, spacing: int = 8) -> tuple[QFrame, QVBoxLayout]:
-    frame = QFrame()
-    frame.setProperty("card", True)
-    lay = QVBoxLayout(frame)
-    lay.setContentsMargins(padding, padding, padding, padding)
-    lay.setSpacing(spacing)
-    return frame, lay
-
-
-def _label(text: str = "", role: str | None = None, wrap: bool = False) -> QLabel:
-    label = QLabel(text)
-    if role:
-        label.setProperty("role", role)
-    label.setWordWrap(wrap)
-    return label
-
-
 class _TextArea(QPlainTextEdit):
     """Multi-line field with QLineEdit-style ``text()``/``setText()``."""
 
@@ -124,61 +111,6 @@ class _TextArea(QPlainTextEdit):
 
     def setText(self, text: str) -> None:  # noqa: N802 (Qt naming)
         self.setPlainText(text)
-
-
-class _ElidedLabel(QLabel):
-    """One-line label that shortens long text with … instead of being clipped."""
-
-    def minimumSizeHint(self) -> QSize:  # noqa: N802
-        return QSize(0, super().minimumSizeHint().height())
-
-    def paintEvent(self, _event) -> None:  # noqa: N802
-        if self.width() < 90:          # a few letters of a path help nobody
-            return
-        p = QPainter(self)
-        p.setPen(self.palette().color(self.foregroundRole()))
-        text = self.fontMetrics().elidedText(self.text(), Qt.ElideMiddle, self.width())
-        p.drawText(self.rect(), int(self.alignment()), text)
-
-
-class _Preview(QWidget):
-    """Large preview of the selected image, scaled to fit (shape kept)."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._pix: QPixmap | None = None
-        self._message = "Select an image to see it here."
-        self.setMinimumHeight(130)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-    def sizeHint(self) -> QSize:  # noqa: N802
-        # Modest preferred height: the fields stay in view first, and any spare
-        # height goes to the preview (it expands).
-        return QSize(480, 170)
-
-    def show_pixmap(self, pix: QPixmap | None, message: str = "") -> None:
-        self._pix = pix
-        self._message = message
-        self.update()
-
-    def paintEvent(self, _event) -> None:  # noqa: N802
-        c = design.colors(theme.current_scheme())
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
-        path = QPainterPath()
-        path.addRoundedRect(self.rect().adjusted(0, 0, -1, -1), design.RADIUS_SM, design.RADIUS_SM)
-        p.fillPath(path, QColor(c["surface-alt"]))
-        if self._pix is not None and not self._pix.isNull():
-            area = self.rect().adjusted(8, 8, -8, -8)
-            size = self._pix.size().scaled(area.size(), Qt.KeepAspectRatio)
-            target = QRect(0, 0, size.width(), size.height())
-            target.moveCenter(area.center())
-            p.drawPixmap(target, self._pix)
-        else:
-            p.setPen(QColor(c["text-muted"]))
-            p.drawText(self.rect().adjusted(12, 12, -12, -12), Qt.AlignCenter | Qt.TextWordWrap,
-                       self._message)
 
 
 class _ImageDelegate(QStyledItemDelegate):
@@ -203,36 +135,16 @@ class _ImageDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         rect = option.rect.adjusted(4, 2, -4, -2)
-        selected = bool(option.state & QStyle.State_Selected)
-        hovered = bool(option.state & QStyle.State_MouseOver)
-        if selected or hovered:
-            bg = QPainterPath()
-            bg.addRoundedRect(rect, design.RADIUS_SM, design.RADIUS_SM)
-            painter.fillPath(bg, QColor(c["selection"] if selected else c["hover"]))
-
-        # Thumbnail, letterboxed so the whole picture shows.
+        paint_tile_background(painter, rect, option, c)
         box = QRect(rect.left() + 8, rect.top() + (rect.height() - self.THUMB) // 2,
                     self.THUMB, self.THUMB)
-        frame = QPainterPath()
-        frame.addRoundedRect(box, 4, 4)
-        painter.fillPath(frame, QColor(c["surface-alt"]))
-        pix = self.page.thumbnail(item.path)
-        if pix is not None:
-            size = pix.size().scaled(box.size(), Qt.KeepAspectRatio)
-            target = QRect(0, 0, size.width(), size.height())
-            target.moveCenter(box.center())
-            painter.setClipPath(frame)
-            painter.drawPixmap(target, pix)
-            painter.setClipping(False)
-        painter.setPen(QColor(c["border"]))
-        painter.drawPath(frame)
+        paint_thumbnail(painter, box, self.page.thumbnail(item.path), c)
 
-        # Text block.
         x = box.right() + 12
         width = rect.right() - x - 8
         base = QFont(option.font)
         bold = QFont(base)
-        bold.setWeight(QFont.DemiBold)
+        bold.setWeight(QFont.Weight.DemiBold)
         fm, fm_bold = QFontMetrics(base), QFontMetrics(bold)
         line = fm.lineSpacing()
         top = rect.top() + (rect.height() - 3 * line) // 2
@@ -248,12 +160,12 @@ class _ImageDelegate(QStyledItemDelegate):
         painter.setPen(Qt.NoPen)
         painter.setBrush(status_color)
         painter.drawEllipse(dot)
-        label = _STATUS_TEXT[item.status]
+        text = _STATUS_TEXT[item.status]
         if item.status == DONE:
-            label += f" · {len(item.meta.keywords)} keywords"
+            text += f" · {len(item.meta.keywords)} keywords"
         painter.setPen(status_color)
         painter.drawText(QRect(x + 14, top + line, width - 14, line),
-                         Qt.AlignLeft | Qt.AlignVCenter, fm.elidedText(label, Qt.ElideRight, width - 14))
+                         Qt.AlignLeft | Qt.AlignVCenter, fm.elidedText(text, Qt.ElideRight, width - 14))
 
         if item.status == FAILED:
             detail, color = item.error or "Unknown error", c["danger"]
@@ -268,31 +180,6 @@ class _ImageDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-class _Banner(QFrame):
-    """Inline message strip for outcomes (export saved, batch failed, …)."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 8, 6, 8)
-        self.text = QLabel()
-        self.text.setWordWrap(True)
-        self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        close = QPushButton("✕")
-        close.setProperty("variant", "ghost")
-        close.setToolTip("Dismiss")
-        close.clicked.connect(self.hide)
-        lay.addWidget(self.text, 1)
-        lay.addWidget(close, 0, Qt.AlignTop)
-        self.hide()
-
-    def show_message(self, kind: str, text: str) -> None:
-        self.setProperty("banner", kind)
-        theme.repolish(self)
-        self.text.setText(text)
-        self.show()
-
-
 class MetadataPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -304,7 +191,7 @@ class MetadataPage(QWidget):
         self._lookup_provider = ""     # which provider the running check belongs to
         self._loading_editor = False
         # Keyword count remembered while the user visits the Ollama modes, whose
-        # target is a full Adobe set (exactly 50) instead of "up to 45".
+        # target is a full Adobe set (exactly 49) instead of "up to 45".
         self._keyword_pref = KEYWORD_COUNT_DEFAULT
         # Folder selections are remembered so a finished folder batch can save
         # its complete CSV back into the folder the user picked.
@@ -330,7 +217,7 @@ class MetadataPage(QWidget):
         root.setContentsMargins(16, 12, 16, 12)
         root.setSpacing(10)
 
-        self.banner = _Banner()
+        self.banner = Banner()
         root.addWidget(self.banner)
 
         self.list_panel = self._build_list_panel()
@@ -348,20 +235,24 @@ class MetadataPage(QWidget):
         self._apply_layout(1280)
 
     def _build_list_panel(self) -> QWidget:
-        box, lay = _card()
+        box, lay = card()
         box.setMinimumSize(320, 210)
         head = QHBoxLayout()
-        head.addWidget(_label("Images", "section"))
+        head.addWidget(label("Images", "section"))
         head.addStretch(1)
-        self.btn_add_images = QPushButton("Add Images…")
+        self.btn_add_images = icon_button(
+            "image-plus", "Add images — choose image files to describe", shortcut="Ctrl+O")
         self.btn_add_images.clicked.connect(self.add_images)
-        self.btn_add_folder = QPushButton("Add Folder…")
+        self.btn_add_folder = icon_button(
+            "folder-plus", f"Add a folder — up to {FOLDER_BATCH_LIMIT} images; its CSV is saved "
+            "there automatically when all succeed", accessible_name="Add folder",
+            shortcut="Ctrl+Shift+O")
         self.btn_add_folder.clicked.connect(self.add_folder)
         head.addWidget(self.btn_add_images)
         head.addWidget(self.btn_add_folder)
         lay.addLayout(head)
 
-        self.count_label = _label("", "muted")
+        self.count_label = label("", "muted")
         lay.addWidget(self.count_label)
 
         filters = QHBoxLayout()
@@ -382,6 +273,7 @@ class MetadataPage(QWidget):
 
         self.grid = QListWidget()
         self.grid.setObjectName("imageList")
+        self.grid.setAccessibleName("Images to describe")
         self.grid.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.grid.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.grid.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -393,18 +285,21 @@ class MetadataPage(QWidget):
         delete = QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self.grid)
         delete.setContext(Qt.ShortcutContext.WidgetShortcut)
         delete.activated.connect(self.remove_selected)
-        self.empty_hint = _label("Add images or a folder — or drag & drop them here.\n"
-                                 "Each image gets its own preview and metadata.", "muted", wrap=True)
+        self.empty_hint = label(f"Add images or a folder (up to {FOLDER_BATCH_LIMIT} images) — "
+                                "or drag & drop them here.\nEach image gets its own preview "
+                                "and metadata.", "muted", wrap=True)
         self.empty_hint.setAlignment(Qt.AlignCenter)
         lay.addWidget(self.grid, 1)
         lay.addWidget(self.empty_hint, 1)
 
         foot = QHBoxLayout()
-        self.btn_remove = QPushButton("Remove Selected")
-        self.btn_remove.clicked.connect(self.remove_selected)
-        self.btn_clear = QPushButton("Clear")
-        self.btn_clear.clicked.connect(self.clear_all)
         foot.addStretch(1)
+        self.btn_remove = icon_button("trash-2", "Remove the selected images from the list",
+                                      accessible_name="Remove selected", shortcut="Del")
+        self.btn_remove.clicked.connect(self.remove_selected)
+        self.btn_clear = icon_button("list-x", "Clear the list — removes every image",
+                                     accessible_name="Clear list")
+        self.btn_clear.clicked.connect(self.clear_all)
         foot.addWidget(self.btn_remove)
         foot.addWidget(self.btn_clear)
         lay.addLayout(foot)
@@ -413,7 +308,7 @@ class MetadataPage(QWidget):
     def _build_editor_panel(self) -> QWidget:
         # The fields scroll when the window is short instead of being squeezed
         # on top of each other.
-        box, outer = _card(padding=4, spacing=0)
+        box, outer = card(padding=4, spacing=0)
         box.setMinimumWidth(340)
         body = QWidget()
         body.setObjectName("cardBody")
@@ -428,48 +323,75 @@ class MetadataPage(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         outer.addWidget(scroll)
 
-        self.preview = _Preview()
+        self.preview = Preview()
         lay.addWidget(self.preview, 1)
 
         self.editor_file = QLabel("No image selected.")
         self.editor_file.setTextFormat(Qt.RichText)
         self.editor_file.setWordWrap(True)
         lay.addWidget(self.editor_file)
-        self.editor_status = _label("", wrap=True)
+        self.editor_status = label("", wrap=True)
         self.editor_status.setTextFormat(Qt.RichText)
         lay.addWidget(self.editor_status)
 
-        def field_head(text: str, counter: QLabel) -> QHBoxLayout:
+        def field_head(text: str, counter: QLabel | None, buddy: QWidget) -> QHBoxLayout:
             row = QHBoxLayout()
             row.setContentsMargins(0, 6, 0, 0)
-            row.addWidget(_label(text, "section"))
+            head = label(text, "section")
+            head.setBuddy(buddy)
+            row.addWidget(head)
             row.addStretch(1)
-            row.addWidget(counter)
+            if counter is not None:
+                row.addWidget(counter)
             return row
 
-        self.title_count = _label("", "counter")
-        lay.addLayout(field_head("Title", self.title_count))
         self.title_edit = QLineEdit()
         self.title_edit.setMaxLength(ADOBE_TITLE_MAX)
         self.title_edit.setPlaceholderText("A short, descriptive title")
+        self.title_edit.setAccessibleName("Title")
+        self.title_count = label("", "counter")
+        lay.addLayout(field_head("Title", self.title_count, self.title_edit))
         lay.addWidget(self.title_edit)
 
-        self.desc_count = _label("", "counter")
-        lay.addLayout(field_head("Description", self.desc_count))
         self.desc_edit = _TextArea(2, 3)
         self.desc_edit.setPlaceholderText("One or two sentences about the picture")
+        self.desc_edit.setAccessibleName("Description")
+        self.desc_count = label("", "counter")
+        lay.addLayout(field_head("Description", self.desc_count, self.desc_edit))
         lay.addWidget(self.desc_edit)
 
-        self.kw_count = _label("", "counter")
-        lay.addLayout(field_head("Keywords", self.kw_count))
         self.kw_edit = _TextArea(2, 4)
         self.kw_edit.setPlaceholderText("Comma-separated, most important first")
+        self.kw_edit.setAccessibleName("Keywords")
+        self.kw_count = label("", "counter")
+        lay.addLayout(field_head("Keywords", self.kw_count, self.kw_edit))
         lay.addWidget(self.kw_edit)
-        lay.addWidget(_label("Edits are kept per image and included when you export.", "hint"))
+
+        self.category_combo = QComboBox()
+        self.category_combo.addItem("Not set", None)
+        for number, name in ADOBE_CATEGORIES.items():
+            self.category_combo.addItem(f"{number} — {name}", number)
+        self.category_combo.setAccessibleName("Adobe Stock category")
+        self.category_combo.setToolTip("The category number written to the CSV — suggested by "
+                                       "the AI; change it if it doesn't fit")
+        lay.addLayout(field_head("Category", None, self.category_combo))
+        lay.addWidget(self.category_combo)
+
+        self.releases_edit = QLineEdit()
+        self.releases_edit.setPlaceholderText("Release file names, if you have releases")
+        self.releases_edit.setAccessibleName("Releases")
+        self.releases_edit.setToolTip(
+            "Exact file names of the model or property releases uploaded to Adobe Stock, "
+            "comma-separated. Leave blank when there is no release.")
+        lay.addLayout(field_head("Releases", None, self.releases_edit))
+        lay.addWidget(self.releases_edit)
+        lay.addWidget(label("Edits are kept per image and included when you export.", "hint"))
 
         self.title_edit.textChanged.connect(self._commit_editor)
         self.desc_edit.textChanged.connect(self._commit_editor)
         self.kw_edit.textChanged.connect(self._commit_editor)
+        self.category_combo.currentIndexChanged.connect(self._commit_editor)
+        self.releases_edit.textChanged.connect(self._commit_editor)
         self._set_editor_enabled(False)
         return box
 
@@ -481,12 +403,15 @@ class MetadataPage(QWidget):
         col.setSpacing(10)
 
         def field(lay: QVBoxLayout, text: str, widget: QWidget) -> None:
-            lay.addWidget(_label(text, "muted"))
+            head = label(text, "muted")
+            head.setBuddy(widget)
+            widget.setAccessibleName(text)
+            lay.addWidget(head)
             lay.addWidget(widget)
 
         # Provider card.
-        card, lay = _card()
-        lay.addWidget(_label("Provider", "section"))
+        provider_card, lay = card()
+        lay.addWidget(label("Provider", "section"))
         self.provider_combo = QComboBox()
         self.provider_combo.addItems(list(SUPPORTED_PROVIDERS))
         self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
@@ -502,6 +427,7 @@ class MetadataPage(QWidget):
         ol = QVBoxLayout(self.ollama_box)
         ol.setContentsMargins(0, 0, 0, 0)
         ol.setSpacing(6)
+        check_row = QHBoxLayout()
         self.ollama_url_widget = QWidget()
         url_lay = QVBoxLayout(self.ollama_url_widget)
         url_lay.setContentsMargins(0, 0, 0, 0)
@@ -511,11 +437,14 @@ class MetadataPage(QWidget):
             "Address of the Ollama API on this computer (or another machine "
             f"running Ollama). Default: {OLLAMA_LOCAL_URL}")
         field(url_lay, "Ollama server", self.ollama_url_edit)
-        ol.addWidget(self.ollama_url_widget)
-        self.btn_ollama_check = QPushButton("Check Connection & Vision Models")
+        check_row.addWidget(self.ollama_url_widget, 1)
+        self.btn_ollama_check = icon_button(
+            "plug-zap", "Check connection — test the Ollama server and list the models that "
+            "can read images", accessible_name="Check connection and vision models")
         self.btn_ollama_check.clicked.connect(self.check_ollama)
-        ol.addWidget(self.btn_ollama_check)
-        self.ollama_notice = _label("", "hint", wrap=True)
+        check_row.addWidget(self.btn_ollama_check, 0, Qt.AlignBottom)
+        ol.addLayout(check_row)
+        self.ollama_notice = label("", "hint", wrap=True)
         ol.addWidget(self.ollama_notice)
         lay.addWidget(self.ollama_box)
 
@@ -524,36 +453,36 @@ class MetadataPage(QWidget):
         key_lay = QVBoxLayout(self.key_box)
         key_lay.setContentsMargins(0, 0, 0, 0)
         key_lay.setSpacing(4)
-        key_lay.addWidget(_label("API key", "muted"))
+        key_head = label("API key", "muted")
+        key_lay.addWidget(key_head)
         key_row = QHBoxLayout()
         self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.Password)
         self.key_edit.setClearButtonEnabled(True)
+        self.key_edit.setAccessibleName("API key")
+        key_head.setBuddy(self.key_edit)
         self.key_edit.textChanged.connect(lambda _t: self._update_key_hint())
-        self.btn_show_key = QPushButton("Show")
-        self.btn_show_key.setCheckable(True)
-        self.btn_show_key.toggled.connect(
-            lambda v: self.key_edit.setEchoMode(
-                QLineEdit.Normal if v else QLineEdit.Password))
-        self.btn_show_key.toggled.connect(
-            lambda v: self.btn_show_key.setText("Hide" if v else "Show"))
+        self.btn_show_key = icon_button("eye", "Show the key while typing",
+                                        accessible_name="Show key", checkable=True)
+        self.btn_show_key.toggled.connect(self._toggle_key_visible)
+        self.btn_forget = icon_button("trash-2", "Forget the saved key for this provider "
+                                      "(Windows Credential Manager)",
+                                      accessible_name="Forget saved key", variant="ghost")
+        self.btn_forget.clicked.connect(self.forget_key)
         key_row.addWidget(self.key_edit, 1)
         key_row.addWidget(self.btn_show_key)
+        key_row.addWidget(self.btn_forget)
         key_lay.addLayout(key_row)
         self.chk_remember = QCheckBox("Remember key in Windows Credential Manager")
         key_lay.addWidget(self.chk_remember)
-        self.btn_forget = QPushButton("Forget saved key")
-        self.btn_forget.setProperty("variant", "ghost")
-        self.btn_forget.clicked.connect(self.forget_key)
-        key_lay.addWidget(self.btn_forget, 0, Qt.AlignLeft)
-        self.key_hint = _label("", "hint", wrap=True)
+        self.key_hint = label("", "hint", wrap=True)
         key_lay.addWidget(self.key_hint)
         lay.addWidget(self.key_box)
-        col.addWidget(card)
+        col.addWidget(provider_card)
 
         # Output card.
-        card, lay = _card()
-        lay.addWidget(_label("Output", "section"))
+        output_card, lay = card()
+        lay.addWidget(label("Output", "section"))
         self.language_combo = QComboBox()
         self.language_combo.addItems(LANGUAGES)
         self.language_combo.setEditable(True)
@@ -568,8 +497,10 @@ class MetadataPage(QWidget):
         field(lay, "Keywords per image", self.keywords_spin)
         self.chk_description = QCheckBox("Generate a description too")
         self.chk_description.setChecked(True)
+        self.chk_description.setToolTip("The description is written into images with Embed "
+                                        "Metadata. The Adobe Stock CSV has no description column.")
         lay.addWidget(self.chk_description)
-        col.addWidget(card)
+        col.addWidget(output_card)
         col.addStretch(1)
 
         scroll = QScrollArea()
@@ -580,52 +511,65 @@ class MetadataPage(QWidget):
         scroll.setMinimumWidth(290)
         return scroll
 
+    def _toggle_key_visible(self, shown: bool) -> None:
+        self.key_edit.setEchoMode(QLineEdit.Normal if shown else QLineEdit.Password)
+        name = "eye-off" if shown else "eye"
+        self.btn_show_key.setProperty("iconName", name)
+        self.btn_show_key.setIcon(icon(name))
+        tip = "Hide the key" if shown else "Show the key while typing"
+        self.btn_show_key.setToolTip(tip)
+        self.btn_show_key.setAccessibleName("Hide key" if shown else "Show key")
+
     def _build_action_bar(self) -> QWidget:
-        box, lay = _card(padding=10, spacing=8)
+        box, lay = card(padding=10, spacing=8)
         progress_row = QHBoxLayout()
-        self.status_label = _label("Idle", "muted")
+        self.status_label = label("Idle", "muted")
         self.status_label.setMinimumWidth(120)
         self.progress = QProgressBar()
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
+        self.progress.setAccessibleName("Overall progress")
         progress_row.addWidget(self.status_label, 2)
         progress_row.addWidget(self.progress, 3)
         lay.addLayout(progress_row)
 
         row = QHBoxLayout()
-        self.generate_btn = QPushButton("Generate Metadata")
-        self.generate_btn.setProperty("variant", "primary")
-        self.generate_btn.setToolTip("Generate metadata for every image that doesn't have it yet")
+        self.generate_btn = icon_button(
+            "sparkles", "Generate metadata for every image that doesn't have it yet",
+            accessible_name="Generate metadata", text="Generate", variant="primary",
+            shortcut="Ctrl+Return")
         self.generate_btn.clicked.connect(self.generate_all)
-        self.retry_failed_btn = QPushButton("Retry Failed")
-        self.retry_failed_btn.setToolTip("Run only the failed images again — finished ones are kept")
+        self.retry_failed_btn = icon_button(
+            "rotate-ccw", "Retry failed — run only the failed images again; finished ones "
+            "are kept", accessible_name="Retry failed images")
         self.retry_failed_btn.clicked.connect(self.retry_failed)
-        self.regen_selected_btn = QPushButton("Regenerate Selected")
-        self.regen_selected_btn.setToolTip("Replace the metadata of the selected images")
+        self.regen_selected_btn = icon_button(
+            "refresh-cw", "Regenerate selected — replace the metadata of the selected images",
+            accessible_name="Regenerate selected images")
         self.regen_selected_btn.clicked.connect(self.regenerate_selected)
-        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn = icon_button("circle-stop", "Cancel the running batch — finished "
+                                      "images keep their metadata", accessible_name="Cancel",
+                                      shortcut="Esc")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self.cancel)
         for b in (self.generate_btn, self.retry_failed_btn, self.regen_selected_btn, self.cancel_btn):
             row.addWidget(b)
         row.addStretch(1)
 
-        self.export_location = _ElidedLabel()
+        self.export_location = ElidedLabel()
         self.export_location.setProperty("role", "hint")
         self.export_location.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         row.addWidget(self.export_location, 1)
-        self.export_btn = QToolButton()
+        self.export_btn = icon_button(
+            "download", "Export — save the current metadata, including your edits, as a CSV",
+            accessible_name="Export CSV", text="Export", shortcut="Ctrl+E")
         self.export_btn.setObjectName("exportButton")
-        self.export_btn.setText("Export")
-        self.export_btn.setProperty("button", True)
-        self.export_btn.setProperty("variant", "primary")
         self.export_btn.setPopupMode(QToolButton.MenuButtonPopup)
-        self.export_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.export_btn.clicked.connect(lambda: self.export_csv())
         menu = QMenu(self.export_btn)
-        self.act_export_as = menu.addAction("Export As…")
+        self.act_export_as = menu.addAction(icon("save"), "Export As…")
         self.act_export_as.triggered.connect(lambda: self.export_csv(choose=True))
-        self.act_embed = menu.addAction("Embed Metadata into Images…")
+        self.act_embed = menu.addAction(icon("tag"), "Embed Metadata into Images…")
         self.act_embed.triggered.connect(self.embed_into_images)
         self.export_btn.setMenu(menu)
         row.addWidget(self.export_btn)
@@ -638,15 +582,16 @@ class MetadataPage(QWidget):
         lay = QVBoxLayout(box)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
-        self.log_toggle = QPushButton("▸ Activity log")
-        self.log_toggle.setProperty("variant", "ghost")
-        self.log_toggle.setCheckable(True)
+        self.log_toggle = icon_button("chevron-right", "Show or hide the activity log",
+                                      accessible_name="Activity log", text="Activity log",
+                                      variant="ghost", checkable=True)
         self.log_toggle.toggled.connect(self._toggle_log)
         lay.addWidget(self.log_toggle, 0, Qt.AlignLeft)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(2000)
         self.log.setPlaceholderText("Metadata log will appear here.")
+        self.log.setAccessibleName("Activity log")
         self.log.setMaximumHeight(130)
         self.log.hide()
         lay.addWidget(self.log)
@@ -654,7 +599,9 @@ class MetadataPage(QWidget):
 
     def _toggle_log(self, shown: bool) -> None:
         self.log.setVisible(shown)
-        self.log_toggle.setText(("▾" if shown else "▸") + " Activity log")
+        name = "chevron-down" if shown else "chevron-right"
+        self.log_toggle.setProperty("iconName", name)
+        self.log_toggle.setIcon(icon(name))
 
     # -- responsive layout ----------------------------------------------------------
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -712,8 +659,8 @@ class MetadataPage(QWidget):
                 "Credential Manager (or the OLLAMA_API_KEY environment variable)."
                 if cloud else
                 "⛁ Local Ollama: images are only sent to the Ollama server on "
-                "your computer and never leave it. No API key is needed — press "
-                "the button above to see your installed image-capable models.")
+                "your computer and never leave it. No API key is needed — use "
+                "the check button to see your installed image-capable models.")
         else:
             self.keywords_spin.setValue(min(self._keyword_pref,
                                             ADOBE_KEYWORDS_MAX))
@@ -857,17 +804,50 @@ class MetadataPage(QWidget):
             n += 1
         return candidate
 
+    def _choose_folder_images(self, folder: Path, images: list[Path], limit: int,
+                              already: int) -> list[Path] | None:
+        """Let the user pick up to *limit* of a folder's images (None = cancelled)."""
+        dialog = FolderPickDialog(folder, images, limit, self.loader, already, self)
+        if dialog.exec() != FolderPickDialog.Accepted:
+            return None
+        return dialog.selected_paths()[:limit]
+
+    def _folder_files(self, folder: Path) -> list[Path] | None:
+        """The images of *folder* to add, keeping its batch within the 25-image limit."""
+        found = [p for p in discover([folder]) if self._key(p) not in self.items]
+        already = sum(1 for it in self.items.values() if self._is_under(it.path, folder))
+        room = FOLDER_BATCH_LIMIT - already
+        if len(found) <= room:
+            return found
+        if room <= 0:
+            QMessageBox.information(
+                self, "Folder batch is full",
+                f"“{folder.name}” already has {already} images in the list — a folder batch "
+                f"holds up to {FOLDER_BATCH_LIMIT}. Remove some to add others.")
+            return None
+        self.log.appendPlainText(
+            f"“{folder}” has {len(found) + already} supported images — a folder batch holds "
+            f"up to {FOLDER_BATCH_LIMIT}; choose which to add.")
+        return self._choose_folder_images(folder, found, room, already)
+
     def _add_paths(self, paths: list[Path]) -> None:
-        # Remember folder selections (Add Folder… or dropped folders) for the
-        # automatic CSV at the end of a batch; plain files register nothing.
-        for p in paths:
+        files: list[Path] = []
+        for p in map(Path, paths):
             try:
-                if p.is_dir() and self._norm(p) not in (self._norm(r)
-                                                        for r in self._folder_roots):
-                    self._folder_roots.append(Path(p))
+                is_dir = p.is_dir()
             except OSError:
                 continue
-        found = collect_images(paths)
+            if not is_dir:
+                files.append(p)
+                continue
+            chosen = self._folder_files(p)
+            if not chosen:
+                continue
+            # Remember the folder for the automatic CSV once its batch completes.
+            if self._norm(p) not in (self._norm(r) for r in self._folder_roots):
+                self._folder_roots.append(p)
+            files.extend(chosen)
+        found = discover(files)
         added = 0
         self.grid.setUpdatesEnabled(False)
         for p in found:
@@ -881,7 +861,6 @@ class MetadataPage(QWidget):
         self.status_label.setText(f"{len(self.items)} image(s) in list")
         if added == 0:
             self.log.appendPlainText("No new supported images found in that selection.")
-            self.banner.show_message("info", "No new supported images were found in that selection.")
         else:
             self.log.appendPlainText(f"Added {added} image(s) for metadata generation.")
         if self.grid.currentItem() is None and self.grid.count():
@@ -911,9 +890,8 @@ class MetadataPage(QWidget):
                 self.preview.show_pixmap(pix)
 
     def add_images(self) -> None:
-        exts = " ".join(f"*{e}" for e in sorted(IMAGE_EXTENSIONS))
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Select images", str(Path.home()), f"Images ({exts});;All files (*)")
+            self, "Select images", str(Path.home()), file_dialog_filter())
         if files:
             self._add_paths([Path(f) for f in files])
 
@@ -962,7 +940,9 @@ class MetadataPage(QWidget):
         self.count_label.setText(" · ".join(parts))
         names = {"all": "All", PENDING: "Pending", DONE: "Done", FAILED: "Failed"}
         for name, btn in self.filter_buttons.items():
-            btn.setText(f"{names[name]} {total if name == 'all' else counts[name]}")
+            count = total if name == "all" else counts[name]
+            btn.setText(f"{names[name]} {count}")
+            btn.setAccessibleName(f"Show {names[name].lower()} images ({count})")
         has_items = total > 0
         self.grid.setVisible(has_items)
         self.empty_hint.setVisible(not has_items)
@@ -1018,7 +998,8 @@ class MetadataPage(QWidget):
         return self.items.get(current.data(_KEY_ROLE)) if current is not None else None
 
     def _set_editor_enabled(self, enabled: bool) -> None:
-        for w in (self.title_edit, self.desc_edit, self.kw_edit):
+        for w in (self.title_edit, self.desc_edit, self.kw_edit, self.category_combo,
+                  self.releases_edit):
             w.setEnabled(enabled)
 
     def _show_item(self, grid_item: QListWidgetItem | None) -> None:
@@ -1029,6 +1010,8 @@ class MetadataPage(QWidget):
             self.title_edit.setText("")
             self.desc_edit.setPlainText("")
             self.kw_edit.setText("")
+            self.category_combo.setCurrentIndex(0)
+            self.releases_edit.setText("")
             self.editor_status.setText("")
             self.preview.show_pixmap(None, "Select an image to see it here." if self.items
                                      else "Add images to get started.")
@@ -1045,9 +1028,13 @@ class MetadataPage(QWidget):
             self.title_edit.setText(meta_item.meta.title)
             self.desc_edit.setPlainText(meta_item.meta.description)
             self.kw_edit.setText(", ".join(meta_item.meta.keywords))
+            self.category_combo.setCurrentIndex(
+                max(0, self.category_combo.findData(meta_item.meta.category)))
+            self.releases_edit.setText(meta_item.meta.releases)
             self._update_status_label(meta_item)
             pix = self.loader.request(str(path), PREVIEW_EDGE) or self.loader.cached(str(path), THUMB_EDGE)
             self.preview.show_pixmap(pix, "Loading preview…")
+            self.preview.setAccessibleDescription(f"Preview of {path.name}")
             self._set_editor_enabled(meta_item.status != GENERATING)
         self._loading_editor = False
         self._update_counters()
@@ -1072,15 +1059,17 @@ class MetadataPage(QWidget):
         meta_item.meta.description = self.desc_edit.toPlainText().strip()
         meta_item.meta.keywords = [
             k.strip() for k in self.kw_edit.text().replace("\n", ",").split(",") if k.strip()]
+        meta_item.meta.category = self.category_combo.currentData()
+        meta_item.meta.releases = self.releases_edit.text().strip()
         self._update_counters()
         self.grid.update(self.grid.indexFromItem(grid_item))
 
     def _update_counters(self) -> None:
-        def show(label: QLabel, text: str, over: bool) -> None:
-            label.setText(text)
-            if label.property("over") != over:
-                label.setProperty("over", over)
-                theme.repolish(label)
+        def show(lbl: QLabel, text: str, over: bool) -> None:
+            lbl.setText(text)
+            if lbl.property("over") != over:
+                lbl.setProperty("over", over)
+                theme.repolish(lbl)
 
         title = len(self.title_edit.text())
         show(self.title_count, f"{title}/{ADOBE_TITLE_MAX}", title > ADOBE_TITLE_MAX)
@@ -1099,7 +1088,7 @@ class MetadataPage(QWidget):
             text = f"● Generated · {len(meta_item.meta.keywords)} keywords"
         elif meta_item.status == FAILED:
             text = (f"● Failed — {html.escape(meta_item.error)}<br><span style='color:{c['text-muted']}'>"
-                    "Fix the cause, then use Retry Failed or Regenerate Selected.</span>")
+                    "Fix the cause, then use Retry failed or Regenerate selected.</span>")
         elif meta_item.status == GENERATING:
             text = "● Generating…"
         else:
@@ -1115,7 +1104,9 @@ class MetadataPage(QWidget):
         meta_item.status = status
         meta_item.error = error
         if meta is not None:
+            releases = meta_item.meta.releases     # typed by the user, never generated
             meta_item.meta = ImageMetadata.from_dict(meta)
+            meta_item.meta.releases = meta_item.meta.releases or releases
         grid_item = self._grid_item(key)
         if grid_item is not None:
             tip = str(meta_item.path)
@@ -1173,8 +1164,8 @@ class MetadataPage(QWidget):
             QMessageBox.warning(
                 self, "No Ollama model selected",
                 f"{provider} needs a model that can analyse images.\n\n"
-                "Press “Check Connection & Vision Models” to list the "
-                "image-capable ones, or type a model name you know works.")
+                "Use the check button to list the image-capable ones, or type "
+                "a model name you know works.")
             return
         self._commit_editor()
         files = [self.items[k].path for k in keys]
@@ -1219,9 +1210,8 @@ class MetadataPage(QWidget):
         if not keys:
             QMessageBox.information(
                 self, "Nothing selected",
-                "Select one or more images in the list first — “Regenerate "
-                "Selected” always re-runs the chosen images, even if they "
-                "already have metadata.")
+                "Select one or more images in the list first — Regenerate selected "
+                "always re-runs the chosen images, even if they already have metadata.")
             return
         self._start_generation(keys, "regenerating selected items")
 
@@ -1260,7 +1250,7 @@ class MetadataPage(QWidget):
                 "warning", f"Batch cancelled after {ok} image(s). "
                 + ("No CSV was saved automatically — it is only written once every image "
                    "in the folder has metadata." if folder_batch else
-                   "Finished metadata is kept; click Generate Metadata to continue."))
+                   "Finished metadata is kept; click Generate to continue."))
             self._update_key_hint()
             return
         if failed:
@@ -1270,16 +1260,16 @@ class MetadataPage(QWidget):
             self.log.appendPlainText(
                 "Temporary failures were already retried automatically — the "
                 "items above failed permanently or are still unresolved. Fix "
-                "the issue (key/model/image) and use “Retry Failed”; "
+                "the issue (key/model/image) and use “Retry failed”; "
                 "completed images are not regenerated.")
             text = (f"{failed} image(s) failed after automatic retries. Select one (or use the "
-                    "Failed filter) to see why, fix it, then click Retry Failed — finished "
+                    "Failed filter) to see why, fix it, then use Retry failed — finished "
                     "images are kept.")
             if folder_batch:
                 self.log.appendPlainText(
                     "CSV auto-export skipped — every image in the folder batch "
                     "must succeed first. Automatic retries already ran; if "
-                    "failures remain, fix them and use “Retry Failed” — once all "
+                    "failures remain, fix them and use “Retry failed” — once all "
                     "images are ✓ the full CSV is written automatically.")
                 text += " The folder's CSV is saved automatically once every image succeeds."
             self.banner.show_message("danger", text)
@@ -1288,11 +1278,11 @@ class MetadataPage(QWidget):
             if saved:
                 self.banner.show_message(
                     "success", f"All images have metadata. Complete CSV saved to {saved[-1]}. "
-                    "Edit anything you like, then click Export to update it.")
+                    "Edit anything you like, then use Export to update it.")
             elif not folder_batch:
                 self.banner.show_message(
                     "success", f"Metadata generated for {ok} image(s). Review or edit it, "
-                    "then click Export to save a CSV.")
+                    "then use Export to save a CSV.")
         self._update_key_hint()
 
     def _auto_export_csv(self) -> list[Path]:
@@ -1380,13 +1370,18 @@ class MetadataPage(QWidget):
         self._update_export_location()
         missing = len(self.items) - len(done)
         untitled = sum(1 for it in done if not it.meta.title.strip())
+        trimmed = sum(1 for it in done if len(sanitize_keywords(
+            it.meta.keywords, len(it.meta.keywords))) > ADOBE_KEYWORDS_MAX)
         text = f"Saved {len(done)} row(s) to {dest}."
         if missing:
             text += f" {missing} image(s) without metadata were left out."
         if untitled:
             text += f" ⚠ {untitled} row(s) have no title."
+        if trimmed:
+            text += (f" ⚠ {trimmed} row(s) had more than {ADOBE_KEYWORDS_MAX} keywords — only "
+                     f"the first {ADOBE_KEYWORDS_MAX} were exported.")
         self.log.appendPlainText(f"✓ {text}")
-        self.banner.show_message("warning" if missing or untitled else "success", text)
+        self.banner.show_message("warning" if missing or untitled or trimmed else "success", text)
         return dest
 
     def embed_into_images(self) -> None:

@@ -414,7 +414,7 @@ def _call_ollama(data: bytes, mime: str, prompt: str, settings: MetadataSettings
         "stream": False,
         "format": "json",
         "think": False,
-        # A 50-keyword Adobe set plus a full description is a long answer; the
+        # A 49-keyword Adobe set plus a full description is a long answer; the
         # budget has to leave room for the closing brace or the JSON is cut off.
         "options": {"temperature": 0.4, "num_predict": 3072},
     }
@@ -483,7 +483,7 @@ def _top_up_keywords(meta: ImageMetadata, data: bytes, mime: str,
                      log=None) -> ImageMetadata:
     """Fill a slightly short keyword list up to the requested exact count, once.
 
-    Small local models often answer with 40–45 of the 50 they were asked for.
+    Small local models often answer with 40–45 of the 49 they were asked for.
     Only a modest shortfall is worth a cheap follow-up: a reply that ignored
     the count completely is better served by "Regenerate Selected" than by a
     second request that re-asks for nearly everything. A failed or empty

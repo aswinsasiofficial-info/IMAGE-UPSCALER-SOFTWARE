@@ -32,7 +32,7 @@ Write-Host "Installing PyTorch (CUDA 12.6 build) - this is a ~2.6 GB download...
 Write-Host "Installing GUI + imaging dependencies..."
 & $py -m pip install PySide6 Pillow numpy
 
-Write-Host "Installing Upscaler web UI dependency (Django)..."
+Write-Host "Installing settings validation dependency (Django)..."
 & $py -m pip install "Django>=5.2"
 
 Write-Host "Installing Metadata Generator dependencies..."

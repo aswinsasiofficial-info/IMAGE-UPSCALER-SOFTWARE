@@ -1,19 +1,15 @@
-"""Design tokens shared by the desktop (Qt) and web (Django) interfaces.
-
-One palette, type scale and set of radii for both, so the Upscaler page
-(HTML, also usable in a browser) and the Metadata screen (Qt widgets) look
-like one app in light and dark mode. ``app/ui/theme.py`` turns these into a
-Qt palette + stylesheet; the Upscaler template turns them into CSS custom
-properties. No Qt or Django imports here.
+"""Design tokens for the desktop app: one palette (light and dark), type
+scale and set of radii shared by every screen. ``app/ui/theme.py`` turns
+these into the Qt palette + stylesheet. No Qt imports here.
 """
 
 from __future__ import annotations
 
 LIGHT, DARK = "light", "dark"
 
-FONT_FAMILY = "Segoe UI"
-FONT_STACK = '"Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif'
-FONT_SIZE_PT = 10              # body text; small text is 9pt, headings 11.5–15pt
+FONT_FAMILY = "Inter Tight"    # bundled: app/assets/fonts (SIL Open Font License)
+FONT_FILE = "InterTight-Variable.ttf"
+FONT_SIZE_PT = 10              # body text; small text is 9pt, headings 11–14pt
 RADIUS = 8                     # cards, panels
 RADIUS_SM = 6                  # buttons, inputs
 
@@ -79,8 +75,3 @@ def normalize_scheme(value: str | None) -> str:
 
 def colors(scheme: str) -> dict[str, str]:
     return COLORS[normalize_scheme(scheme)]
-
-
-def css_variables(scheme: str) -> str:
-    """``--bg:#…;--surface:#…;…`` for one scheme."""
-    return "".join(f"--{name}:{value};" for name, value in colors(scheme).items())

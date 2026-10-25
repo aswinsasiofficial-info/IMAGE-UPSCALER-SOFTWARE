@@ -7,8 +7,8 @@ metadata including edits, asks for a location only the first time, Export
 As… asks again; folder batches of 25 images that retry temporary failures
 for the failed images only and save the complete CSV into the folder only
 when every image succeeded (never after a permanent failure or a cancel);
-lazy thumbnails and the large preview; status filters/counts; and the
-responsive three-column / tabs / stacked layouts.
+the 25-image folder limit and its chooser; lazy thumbnails and the large
+preview; status filters/counts; and the responsive layouts.
 """
 
 from __future__ import annotations
@@ -82,14 +82,23 @@ def test_export_button(tmp: Path) -> None:
     assert not page.export_btn.isEnabled()                    # nothing generated yet
 
     keys = list(page.items)
-    page._set_status(keys[0], DONE, meta={"title": "Alpha", "description": "d1", "keywords": ["x", "y"]})
+    page._set_status(keys[0], DONE, meta={"title": "Alpha", "description": "d1",
+                                          "keywords": ["x", "y"], "category": 7})
     page._set_status(keys[1], DONE, meta={"title": "Beta", "description": "d2", "keywords": ["z"]})
     assert page.export_btn.isEnabled()
 
+    # The editor shows the suggested category; Releases starts blank.
+    page.grid.setCurrentItem(page._grid_item(keys[0]))
+    assert page.category_combo.currentData() == 7 and page.releases_edit.text() == ""
+    assert page.category_combo.count() == 22                  # "Not set" + 21 categories
+
     # A user edit in the editor is part of the export.
     page.grid.setCurrentItem(page._grid_item(keys[1]))
+    assert page.category_combo.currentData() is None
     page.title_edit.setText("Beta, edited by hand")
     page.kw_edit.setText("one, two,\nthree")
+    page.category_combo.setCurrentIndex(page.category_combo.findData(11))
+    page.releases_edit.setText("model-release.jpg")
 
     dest = tmp / "chosen" / "my metadata.csv"
     dialog = SaveDialog(str(dest))
@@ -99,9 +108,10 @@ def test_export_button(tmp: Path) -> None:
         page.export_btn.click()
         assert dialog.calls == 1, "first Export must ask where to save"
         rows = _read_csv(dest)
-        assert rows[0] == ["Filename", "Title", "Description", "Keywords"]
-        assert rows[1:] == [["a.png", "Alpha", "d1", "x, y"],
-                            ["b.png", "Beta, edited by hand", "d2", "one, two, three"]], rows
+        assert rows[0] == ["Filename", "Title", "Keywords", "Category", "Releases"]
+        assert rows[1:] == [["a.png", "Alpha", "x, y", "7", ""],
+                            ["b.png", "Beta, edited by hand", "one, two, three", "11",
+                             "model-release.jpg"]], rows
         assert "1 image(s) without metadata were left out" in page.banner.text.text()
         assert page.csv_path == dest and dest.name in page.export_location.text()
 
@@ -110,6 +120,18 @@ def test_export_button(tmp: Path) -> None:
         page.export_btn.click()
         assert dialog.calls == 1
         assert _read_csv(dest)[2][1] == "Beta v2"
+
+        # More than 49 keywords: the first 49 are exported and the banner says so.
+        page.kw_edit.setText(", ".join(f"k{i}" for i in range(55)))
+        page.export_btn.click()
+        assert _read_csv(dest)[2][2].split(", ") == [f"k{i}" for i in range(49)]
+        assert "only the first 49 were exported" in page.banner.text.text()
+
+        # Regenerating keeps the releases the user typed (they're never generated).
+        page._set_status(keys[1], DONE, meta={"title": "Beta new", "keywords": ["n"],
+                                              "category": 13})
+        assert page.items[keys[1]].meta.releases == "model-release.jpg"
+        assert page.items[keys[1]].meta.category == 13
 
         # Export As… asks again; cancelling it changes nothing.
         page.act_export_as.trigger()
@@ -256,7 +278,7 @@ def test_thumbnails_and_preview(tmp: Path) -> None:
 
     page = MetadataPage()
     started = time.monotonic()
-    page._add_paths([many])
+    page._add_paths(sorted(many.iterdir()))          # picked files: no folder-batch limit
     elapsed = time.monotonic() - started
     assert len(page.items) == 301 and elapsed < 3.0, elapsed
     assert not page.loader._cache, "adding images must not decode thumbnails up front"
@@ -287,6 +309,82 @@ def test_thumbnails_and_preview(tmp: Path) -> None:
     page.hide()
     page.shutdown()
     print("  thumbnails: lazy, EXIF-aware, 301 images added fast; large preview OK")
+
+
+def test_folder_batch_limit(tmp: Path) -> None:
+    from app.ui.folder_picker import FolderPickDialog
+    from app.ui.metadata_page import FOLDER_BATCH_LIMIT, MetadataPage
+
+    assert FOLDER_BATCH_LIMIT == 25
+    big = _folder(tmp, "big30", 30)
+    page = MetadataPage()
+    asked: list[tuple] = []
+
+    def choose(folder, images, limit, already):
+        asked.append((folder, len(images), limit, already))
+        return images[5:5 + limit]                       # the user picks 25 of them
+
+    page._choose_folder_images = choose
+    page._add_paths([big])
+    assert asked == [(big, 30, 25, 0)], asked
+    names = sorted(it.path.name for it in page.items.values())
+    assert len(names) == 25 and names[0] == "img05.jpg" and names[-1] == "img29.jpg"
+    assert page._folder_roots == [big]
+    assert any("30 supported images" in line for line in page.log.toPlainText().splitlines())
+
+    # The folder batch is full now: adding it again explains and adds nothing.
+    shown: list[tuple] = []
+    original = QMessageBox.information
+    QMessageBox.information = staticmethod(lambda _p, t, x, *a: shown.append((t, x)))
+    try:
+        page._add_paths([big])
+    finally:
+        QMessageBox.information = original
+    assert len(page.items) == 25 and shown and shown[0][0] == "Folder batch is full", shown
+
+    # Room left after removing some: the chooser offers only that many.
+    page.grid.setCurrentRow(0)
+    for i in range(3):
+        page.grid.item(i).setSelected(True)
+    page.remove_selected()
+    asked.clear()
+    page._add_paths([big])
+    assert asked and asked[0][1:] == (8, 3, 22), asked      # 8 not yet added, room for 3
+    assert len(page.items) == 25
+
+    # A cancelled chooser adds nothing.
+    page2 = MetadataPage()
+    page2._choose_folder_images = lambda *a: None
+    page2._add_paths([big])
+    assert not page2.items and not page2._folder_roots
+
+    # Exactly 25: no chooser at all.
+    page3 = MetadataPage()
+    page3._choose_folder_images = lambda *a: (_ for _ in ()).throw(AssertionError("asked"))
+    page3._add_paths([_folder(tmp, "exact25", 25)])
+    assert len(page3.items) == 25
+
+    # The chooser itself: first 25 ticked, can't accept more than the limit.
+    images = sorted(big.glob("*.jpg"))
+    dialog = FolderPickDialog(big, images, 25, page.loader)
+    assert dialog.grid.count() == 30 and len(dialog.selected_paths()) == 25
+    assert dialog.counter.text() == "25 of 25 selected" and dialog.ok.isEnabled()
+    assert dialog.ok.text() == "Add 25 Images"
+    dialog.toggle(dialog.grid.item(27))                      # tick a 26th
+    assert not dialog.ok.isEnabled() and "untick 1" in dialog.counter.text()
+    dialog.toggle(dialog.grid.item(0))                       # untick one → back to 25
+    assert dialog.ok.isEnabled()
+    picked = dialog.selected_paths()
+    assert len(picked) == 25 and images[0] not in picked and images[27] in picked
+    dialog.select_first()
+    assert dialog.selected_paths() == images[:25]
+    dialog._set_all(0)
+    assert not dialog.ok.isEnabled() and dialog.counter.text() == "0 of 25 selected"
+    assert dialog.grid.accessibleName() and dialog.windowTitle() == "Choose up to 25 images"
+    dialog.deleteLater()
+    for p in (page, page2, page3):
+        p.shutdown()
+    print("  25-image folder limit: chooser, full batch, remaining room, cancel OK")
 
 
 def test_filters_counts_and_layout(tmp: Path) -> None:
@@ -346,6 +444,7 @@ def main() -> int:
             test_export_button(t)
             test_folder_batch_of_25(t)
             test_thumbnails_and_preview(t)
+            test_folder_batch_limit(t)
             test_filters_counts_and_layout(t)
     except Exception:
         import traceback

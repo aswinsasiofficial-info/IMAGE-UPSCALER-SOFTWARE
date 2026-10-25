@@ -12,33 +12,42 @@ import os
 import tempfile
 from pathlib import Path
 
-from .metadata_settings import ImageMetadata
+from .metadata_settings import ADOBE_KEYWORDS_MAX, ImageMetadata, parse_category, sanitize_keywords
 
-# Adobe Stock contributor CSV template (Description added for generality —
-# stock sites ignore unknown columns they don't use).
-CSV_HEADERS = ["Filename", "Title", "Description", "Keywords"]
+# Adobe Stock's CSV template — exact header names and order.
+CSV_HEADERS = ["Filename", "Title", "Keywords", "Category", "Releases"]
 
 # File formats we can safely rewrite with embedded metadata.
 EMBEDDABLE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 
 
-def write_csv(rows: list[tuple[Path, ImageMetadata]], dest: Path) -> Path:
-    """Write all reviewed rows to one contributor-friendly CSV (UTF-8 with BOM).
+def csv_keywords(meta: ImageMetadata) -> list[str]:
+    """The keywords that go into the CSV: in order, de-duplicated, at most 49."""
+    return sanitize_keywords(meta.keywords, ADOBE_KEYWORDS_MAX)
 
-    ``rows`` is a list of (image_path, metadata) pairs; keyword lists are
-    joined with commas as stock sites expect.
+
+def write_csv(rows: list[tuple[Path, ImageMetadata]], dest: Path) -> Path:
+    """Write all reviewed rows as an Adobe Stock CSV (UTF-8 with BOM).
+
+    ``rows`` is a list of (image_path, metadata) pairs. Keywords go into one
+    comma-separated cell (most important first, capped at 49); Category is
+    the category number; Releases stays blank unless the user entered
+    release file names. Fields holding commas are quoted, so a keyword list
+    can never spill into extra columns.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
         writer.writerow(CSV_HEADERS)
         for path, meta in rows:
+            category = parse_category(meta.category)
             writer.writerow([
                 path.name,
                 meta.title,
-                meta.description,
-                ", ".join(meta.keywords),
+                ", ".join(csv_keywords(meta)),
+                "" if category is None else str(category),
+                " ".join(meta.releases.split()),
             ])
     return dest
 

@@ -11,9 +11,18 @@ from dataclasses import dataclass, field
 
 # Adobe Stock contributor limits (used to clamp generated text).
 ADOBE_TITLE_MAX = 70
-ADOBE_KEYWORDS_MAX = 50          # Adobe's hard cap — the UI never offers more
+ADOBE_KEYWORDS_MAX = 49          # per image in the Adobe Stock CSV — the UI never offers more
 ADOBE_KEYWORD_MAX = 40
 ADOBE_DESCRIPTION_MAX = 2000
+
+# Adobe Stock's 21 contributor categories; the CSV's Category column holds the number.
+ADOBE_CATEGORIES = {
+    1: "Animals", 2: "Buildings and Architecture", 3: "Business", 4: "Drinks",
+    5: "The Environment", 6: "States of Mind", 7: "Food", 8: "Graphic Resources",
+    9: "Hobbies and Leisure", 10: "Industry", 11: "Landscape", 12: "Lifestyle",
+    13: "People", 14: "Plants and Flowers", 15: "Culture and Religion", 16: "Science",
+    17: "Social Issues", 18: "Sports", 19: "Technology", 20: "Transport", 21: "Travel",
+}
 
 OLLAMA_LOCAL = "Ollama (Local)"
 OLLAMA_CLOUD = "Ollama Cloud"
@@ -83,7 +92,7 @@ MODEL_CATALOGUES = {
 }
 
 KEYWORD_COUNT_DEFAULT = 45       # Gemini/Groq: leave Adobe's last slot free
-OLLAMA_KEYWORD_COUNT = ADOBE_KEYWORDS_MAX   # Ollama: a full Adobe set (50)
+OLLAMA_KEYWORD_COUNT = ADOBE_KEYWORDS_MAX   # Ollama: a full Adobe set (49)
 
 # Provider families that talk to the Ollama API (local server or hosted cloud).
 OLLAMA_PROVIDERS = (OLLAMA_LOCAL, OLLAMA_CLOUD)
@@ -133,14 +142,22 @@ class MetadataSettings:
 
 @dataclass
 class ImageMetadata:
-    """The editable, exportable metadata attached to one image."""
+    """The editable, exportable metadata attached to one image.
+
+    ``category`` is an Adobe Stock category number (suggested by the model,
+    editable). ``releases`` is only ever typed by the user — the model is never
+    asked for it, so the CSV column stays blank unless release info exists.
+    """
     title: str = ""
     description: str = ""
     keywords: list[str] = field(default_factory=list)
+    category: int | None = None
+    releases: str = ""
 
     def as_dict(self) -> dict:
         return {"title": self.title, "description": self.description,
-                "keywords": list(self.keywords)}
+                "keywords": list(self.keywords), "category": self.category,
+                "releases": self.releases}
 
     @staticmethod
     def from_dict(data: dict) -> "ImageMetadata":
@@ -148,7 +165,25 @@ class ImageMetadata:
             title=str(data.get("title", "")),
             description=str(data.get("description", "")),
             keywords=[str(k) for k in data.get("keywords", [])],
+            category=parse_category(data.get("category")),
+            releases=str(data.get("releases") or ""),
         )
+
+
+def parse_category(value) -> int | None:
+    """An Adobe Stock category number from ``7``, ``"7"``, ``"7 - Food"`` or
+    ``"Food"``; ``None`` for anything that isn't one of the 21 categories."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = int(value)
+        return number if number == value and number in ADOBE_CATEGORIES else None
+    text = str(value).strip()
+    digits = text.split()[0].rstrip(".:-") if text else ""
+    if digits.isdigit():
+        return int(digits) if int(digits) in ADOBE_CATEGORIES else None
+    names = {name.lower(): number for number, name in ADOBE_CATEGORIES.items()}
+    return names.get(text.lower())
 
 
 class ProviderError(RuntimeError):
@@ -191,6 +226,8 @@ def sanitize_metadata(meta: ImageMetadata, settings: MetadataSettings) -> ImageM
         description="" if not settings.generate_description
         else clamp_text(meta.description, ADOBE_DESCRIPTION_MAX),
         keywords=sanitize_keywords(meta.keywords, min(settings.keyword_count, ADOBE_KEYWORDS_MAX)),
+        category=parse_category(meta.category),
+        releases=meta.releases,
     )
 
 
@@ -207,11 +244,13 @@ def build_prompt(settings: MetadataSettings) -> str:
         "You are preparing Adobe Stock contributor metadata for the attached image.\n"
         f"Write all values in {settings.language}.\n"
         "Respond with ONLY a JSON object, no markdown fences, using exactly this shape:\n"
-        '{"title": "...", "description": "...", "keywords": ["..."]}\n'
+        '{"title": "...", "description": "...", "keywords": ["..."], "category": 1}\n'
         f"- title: max {ADOBE_TITLE_MAX} characters, descriptive, no punctuation at the end\n"
         f"{desc_line}\n"
         f"- keywords: {quantity} {n} single words or short phrases, most important first, "
         "no duplicates, no trademarks or artist names\n"
+        "- category: the number of the ONE Adobe Stock category that fits best: "
+        + ", ".join(f"{number} {name}" for number, name in ADOBE_CATEGORIES.items()) + "\n"
     )
 
 
@@ -234,6 +273,8 @@ def parse_model_json(text: str, settings: MetadataSettings) -> ImageMetadata:
         title=str(payload.get("title", "")),
         description=str(payload.get("description", "")),
         keywords=list(payload.get("keywords", []) or []),
+        category=parse_category(payload.get("category")),
+        # releases are deliberately not read: only real release info belongs there
     )
     return sanitize_metadata(meta, settings)
 

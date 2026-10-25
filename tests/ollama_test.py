@@ -232,7 +232,7 @@ def test_ollama_keyword_target() -> None:
 
 
 def test_ollama_keyword_top_up_completes_the_set() -> None:
-    """A model that answers with 45 of the 50 requested keywords gets exactly one
+    """A model that answers with 45 of the 49 requested keywords gets exactly one
     follow-up for the missing ones; a failing follow-up never discards the
     metadata that already arrived."""
     first = ('{"title": "T", "description": "D", "keywords": ['
@@ -247,7 +247,7 @@ def test_ollama_keyword_top_up_completes_the_set() -> None:
     calls = http.chat_calls()
     assert len(calls) == 2, calls
     top_up = calls[1]["body"]["messages"][0]["content"]
-    assert "exactly 5 additional" in top_up, top_up
+    assert f"exactly {ADOBE_KEYWORDS_MAX - 45} additional" in top_up, top_up
     assert "k0" in top_up, top_up                      # never repeat what we have
     assert len(meta.keywords) == ADOBE_KEYWORDS_MAX, len(meta.keywords)
     assert meta.keywords[0] == "k0" and "extra0" in meta.keywords, meta.keywords

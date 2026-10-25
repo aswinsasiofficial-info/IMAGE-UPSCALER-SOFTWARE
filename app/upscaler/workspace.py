@@ -1,10 +1,9 @@
 """The Upscaler's queue and its background batch job.
 
-One :class:`Workspace` lives in the desktop process (a single-user app) and
-is shared by every request the embedded Django server handles. A batch runs
-on a plain thread so the page stays responsive while it polls for progress.
-The Real-ESRGAN model is loaded once per batch and released afterwards, and
-cancellation is honoured between tiles and between images.
+One :class:`Workspace` lives in the desktop process (a single-user app). A
+batch runs on a plain thread so the screen stays responsive while it polls
+for progress. The Real-ESRGAN model is loaded once per batch and released
+afterwards, and cancellation is honoured between tiles and between images.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from . import imaging
 from .engine import Cancelled, RealESRGAN
 from .files import (DEFAULT_OUTPUT_DIR, OUTPUT_DIR_NAME, SequentialNamer, discover, extension,
                     find_root, output_dir_for, output_filename, path_key, unique_path)
-from .geometry import MAX_SIDE, MODEL_SCALE, SizeOptions, describe, plan_size
+from .geometry import DEFAULT_FACTOR, MAX_SIDE, MODEL_SCALE, describe, plan_size
 
 LOG_LIMIT = 5000
 
@@ -32,24 +31,18 @@ class QueueItem:
     height: int
     has_alpha: bool
 
-    def as_json(self) -> dict:
-        return {"id": self.id, "name": self.path.name, "path": str(self.path),
-                "width": self.width, "height": self.height, "has_alpha": self.has_alpha}
-
 
 @dataclass(frozen=True)
 class JobOptions:
-    size: SizeOptions = SizeOptions()
-    pad_color: str = "white"
+    factor: int = DEFAULT_FACTOR       # 1-5, applied to both sides
     output_dir: Path = DEFAULT_OUTPUT_DIR
     save_beside: bool = False
     device: str = "auto"
     fp16: bool = True
     tile: int = 256
-    output_format: str = "png"
+    output_format: str = "jpg"
     jpg_quality: int = 95
-    suffix: str = "_x4"
-    rename_batch: bool = False
+    rename_batch: bool = True          # PREFIX1, PREFIX2 … (off: keep original names)
 
 
 def default_engine(options: JobOptions) -> RealESRGAN:
@@ -178,8 +171,7 @@ class Job:
                 try:
                     folder = output_dir_for(item.path, self.roots, opts.save_beside, opts.output_dir)
                     out_path = (namer.next_path(folder, ext) if namer is not None else
-                                unique_path(folder / output_filename(item.path, opts.suffix,
-                                                                     opts.output_format)))
+                                unique_path(folder / output_filename(item.path, opts.output_format)))
                     size = self._process(engine, item, out_path)
                     with self._lock:
                         self.ok += 1
@@ -218,10 +210,7 @@ class Job:
         src = imaging.load(item.path)
         sw, sh = src.size
         # Re-plan from the pixels actually loaded, in case the file changed since queueing.
-        plan = plan_size(sw, sh, opts.size)
-        if not plan.resolved:
-            raise ValueError(f"{sw}x{sh} has a different shape from the "
-                             f"{plan.output[0]}x{plan.output[1]} frame — choose Pad or Crop first")
+        plan = plan_size(sw, sh, opts.factor)
         if max(plan.output) > MAX_SIDE:
             raise ValueError(f"output {plan.output[0]}x{plan.output[1]} exceeds "
                              f"{MAX_SIDE:,} px per side")
@@ -230,7 +219,7 @@ class Job:
         ai_size = (ai.shape[1], ai.shape[0])
         if ai_size != (sw * MODEL_SCALE, sh * MODEL_SCALE):
             raise RuntimeError(f"model returned {ai_size[0]}x{ai_size[1]}, expected exactly 4x")
-        img = imaging.compose(ai, src.alpha, plan, opts.pad_color)
+        img = imaging.compose(ai, src.alpha, plan)
         imaging.save(img, out_path, opts.output_format, opts.jpg_quality, src.icc_profile)
 
         saved = imaging.saved_size(out_path)
@@ -241,7 +230,7 @@ class Job:
         if ai_size != saved:
             steps += f"AI {ai_size[0]}x{ai_size[1]} -> "
         self.log(f"[OK] {item.path.name}: {steps}{saved[0]}x{saved[1]} "
-                 f"({describe(plan, opts.size)}) -> {out_path}")
+                 f"({describe(plan)}) -> {out_path}")
         return saved
 
 
@@ -253,18 +242,6 @@ class AddResult:
     unreadable: list[tuple[Path, str]] = field(default_factory=list)
     missing: list[Path] = field(default_factory=list)
     duplicates: int = 0
-
-    def as_json(self) -> dict:
-        return {
-            "added": len(self.added),
-            "folders": [{"path": str(p), "count": n} for p, n in self.folders],
-            "empty_folders": [str(p) for p in self.empty_folders],
-            "unreadable": [{"path": str(p), "error": e} for p, e in self.unreadable],
-            "missing": [str(p) for p in self.missing],
-            "duplicates": self.duplicates,
-            "output_dir_name": OUTPUT_DIR_NAME,
-        }
-
 
 class Workspace:
     def __init__(self, engine_factory: EngineFactory = default_engine) -> None:

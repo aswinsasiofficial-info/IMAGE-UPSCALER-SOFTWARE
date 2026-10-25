@@ -16,3 +16,7 @@ install_torch.log
 # User output
 out/
 Upscaled/
+
+# Packaging output (build.ps1)
+build/
+dist/

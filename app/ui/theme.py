@@ -1,11 +1,13 @@
-"""Qt side of the shared design (app/design.py): palette + stylesheet.
+"""Qt side of the design (app/design.py): font, palette and stylesheet.
 
-The desktop follows the system's light/dark setting (Qt 6.5+), and re-themes
-live when it changes; ``UPSCALER_THEME=light|dark`` forces one. Widgets opt
-into roles with dynamic properties instead of per-widget styles:
+The bundled Inter Tight font is registered and used everywhere. The app
+follows the system's light/dark setting (Qt 6.5+) and re-themes live when it
+changes; ``UPSCALER_THEME=light|dark`` forces one. Widgets opt into roles with
+dynamic properties instead of per-widget styles:
 
-  * ``QFrame[card="true"]``            white (or dark) rounded panel
-  * ``QPushButton[variant="primary"]`` main action; ``"ghost"`` quiet action
+  * ``QFrame[card="true"]``            rounded panel
+  * ``QToolButton[iconOnly="true"]``   square icon button (see app/ui/icons.py)
+  * ``[variant="primary"]`` main action; ``"ghost"`` quiet action
   * ``QLabel[role="title"|"section"|"muted"|"hint"]``  type styles
   * ``QFrame[banner="success"|"warning"|"danger"|"info"]`` inline messages
 """
@@ -17,10 +19,22 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPalette
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPalette
 from PySide6.QtWidgets import QApplication
 
-from app import design
+from app import design, paths
+
+_font_family: str | None = None
+
+
+def register_fonts() -> str:
+    """Load the bundled Inter Tight (once); returns the family actually available."""
+    global _font_family
+    if _font_family is None:
+        font_id = QFontDatabase.addApplicationFont(str(paths.asset("fonts", design.FONT_FILE)))
+        families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+        _font_family = families[0] if families else design.FONT_FAMILY
+    return _font_family
 
 _ICON_DIR = Path(tempfile.gettempdir()) / "batch-upscaler-ui"
 
@@ -78,12 +92,13 @@ def palette(scheme: str) -> QPalette:
 
 def stylesheet(scheme: str) -> str:
     c = design.colors(scheme)
+    family = _font_family or design.FONT_FAMILY
     down = _arrow("down", c["text-muted"], "2,3.5 5,6.5 8,3.5")
     up = _arrow("up", c["text-muted"], "2,6.5 5,3.5 8,6.5")
     check = _arrow("check", c["primary-text"], "3.5,8.5 6.5,11.5 12.5,5", size=16, stroke=2)
     r, rs = design.RADIUS, design.RADIUS_SM
     return f"""
-QWidget {{ color: {c['text']}; font-family: "{design.FONT_FAMILY}"; font-size: {design.FONT_SIZE_PT}pt; }}
+QWidget {{ color: {c['text']}; font-family: "{family}"; font-size: {design.FONT_SIZE_PT}pt; }}
 QMainWindow, QStackedWidget, QWidget#page, QScrollArea, QScrollArea > QWidget > QWidget#scrollBody {{ background: {c['bg']}; }}
 QToolTip {{ background: {c['surface']}; color: {c['text']}; border: 1px solid {c['border']}; padding: 6px 8px; border-radius: {rs}px; }}
 
@@ -112,12 +127,25 @@ QPushButton[variant="primary"]:disabled, QToolButton[variant="primary"]:disabled
 QPushButton[variant="ghost"] {{ background: transparent; border-color: transparent; color: {c['text-muted']}; padding: 4px 10px; }}
 QPushButton[variant="ghost"]:hover {{ background: {c['hover']}; color: {c['text']}; }}
 QPushButton[variant="danger"] {{ color: {c['danger']}; }}
-QPushButton[segment="true"] {{ border-radius: {rs}px; padding: 4px 10px; color: {c['text-muted']}; background: transparent; border-color: transparent; }}
+QPushButton[segment="true"] {{ border-radius: {rs}px; padding: 4px 10px; color: {c['text-muted']};
+    background: {c['surface-alt']}; border: 1px solid {c['border']}; }}
 QPushButton[segment="true"]:hover {{ background: {c['hover']}; color: {c['text']}; }}
-QPushButton[segment="true"]:checked {{ background: {c['primary-soft']}; color: {c['accent']}; font-weight: 600; }}
-QToolButton[variant="primary"]::menu-button {{ border: none; border-left: 1px solid {c['primary-hover']}; width: 24px; }}
-QToolButton::menu-arrow {{ image: url({_arrow("down", c['primary-text'], "2,3.5 5,6.5 8,3.5")}); width: 10px; height: 10px; }}
-QToolButton#exportButton {{ padding-left: 18px; padding-right: 34px; }}
+QPushButton[segment="true"]:checked {{ background: {c['primary-soft']}; color: {c['accent']};
+    border-color: {c['accent']}; font-weight: 600; }}
+QPushButton[segment="true"]:disabled {{ color: {c['text-faint']}; }}
+QToolButton[button="true"]::menu-button {{ border: none; border-left: 1px solid {c['border-strong']}; width: 24px; }}
+QToolButton[variant="primary"]::menu-button {{ border-left-color: {c['primary-hover']}; }}
+QToolButton::menu-arrow {{ image: url({down}); width: 10px; height: 10px; }}
+QToolButton[variant="primary"]::menu-arrow {{ image: url({_arrow("down", c['primary-text'], "2,3.5 5,6.5 8,3.5")}); }}
+QToolButton[button="true"][variant="ghost"] {{ background: transparent; border-color: transparent; color: {c['text-muted']}; }}
+QToolButton[button="true"][variant="ghost"]:hover {{ background: {c['hover']}; color: {c['text']}; }}
+QToolButton#exportButton {{ padding-left: 12px; padding-right: 34px; }}
+QToolButton[iconOnly="true"] {{ min-width: 34px; max-width: 34px; min-height: 34px; max-height: 34px; padding: 0; }}
+QToolButton[iconOnly="true"][variant="ghost"] {{ background: transparent; border-color: transparent; }}
+QToolButton[iconOnly="true"][variant="ghost"]:hover {{ background: {c['hover']}; }}
+QToolButton[iconOnly="true"]:checked {{ background: {c['primary-soft']}; border-color: {c['accent']}; }}
+QToolButton[button="true"]:focus {{ border-color: {c['accent']}; }}
+QToolButton[button="true"][variant="primary"] {{ padding: 6px 14px 6px 10px; }}
 
 QCheckBox, QRadioButton {{ spacing: 8px; }}
 QCheckBox::indicator, QRadioButton::indicator {{ width: 16px; height: 16px; border: 1px solid {c['border-strong']}; background: {c['surface']}; }}
@@ -198,9 +226,10 @@ def apply(app: QApplication | None = None, scheme: str | None = None) -> str:
     """Theme the whole application; returns the scheme used."""
     app = app or QApplication.instance()
     scheme = design.normalize_scheme(scheme or system_scheme())
+    family = register_fonts()
     app.setStyle("Fusion")
     app.setPalette(palette(scheme))
-    font = QFont(design.FONT_FAMILY)
+    font = QFont(family)
     font.setPointSizeF(design.FONT_SIZE_PT)
     app.setFont(font)
     app.setStyleSheet(stylesheet(scheme))
