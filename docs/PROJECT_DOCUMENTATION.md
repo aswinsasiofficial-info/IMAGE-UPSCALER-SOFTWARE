@@ -1,13 +1,23 @@
 # Batch Image Upscaler + Metadata Generator — Comprehensive Project Documentation
 
-**Version:** 1.4 · **Model:** Real-ESRGAN `x4plus` · **Stack:** Python 3.10+, PyTorch (CUDA 12.6), PySide6 (Qt 6)
+**Version:** 2.0 · **Model:** Real-ESRGAN `x4plus` · **Stack:** Python 3.10+, PyTorch (CUDA 12.6), PySide6 (Qt 6 + Qt WebEngine), Django
 
-A fully local, GPU-accelerated Windows desktop application that batch-upscales images **4×**
-using the **Real-ESRGAN x4plus** super-resolution model. It is tuned to run on an
-**NVIDIA RTX 3050 (6 GB VRAM)** with 16 GB system RAM, processes 20–30+ images per batch,
-and requires **no internet connection after the one-time model-weight download**.
-Every saved output is **exactly 8000 × 5000 px by default** (configurable), reached by a
-crop-to-fill resize that never stretches the image.
+A fully local, GPU-accelerated Windows desktop application that batch-upscales images
+(**4× by default**) using the **Real-ESRGAN x4plus** super-resolution model. It is tuned to
+run on an **NVIDIA RTX 3050 (6 GB VRAM)** with 16 GB system RAM, processes 20–30+ images per
+batch, and requires **no internet connection after the one-time model-weight download**.
+Every output keeps **its own aspect ratio and its whole picture**: width and height are
+multiplied by the same factor, and nothing is cropped, stretched or zoomed unless the user
+explicitly asks for an exact size *and* picks padding or cropping for it.
+
+> **Version 2.0 rebuilt the Upscaler from scratch as a Django app** shown inside the
+> desktop window. The fixed 8000 × 5000 crop-to-fill output of 1.x is gone. The new
+> implementation is described in
+> [Section 16 — Upscaler 2.0 (Django)](#16-upscaler-20-django). Sections **3.2–3.5,
+> 5.3–5.4, 6.3, 8 and 11** below describe the *previous* upscaler modules
+> (`app/engine/realesrgan_upscaler.py`, `rrdbnet.py`, `worker.py`,
+> `app/ui/upscale_page.py`), which remain in the repository but are no longer used by
+> the app — except `worker.collect_images`, which the Metadata screen still imports.
 
 Since v1.4 the app also hosts a second, **completely independent** feature screen —
 the **Metadata Generator** (top navigation → *Metadata*) — which produces Adobe
@@ -17,12 +27,11 @@ cloud API). See [Section 14 — Metadata Generator](#14-metadata-generator).
 
 > **Note on resampling:** the neural network's internal upsampling uses
 > **nearest-neighbor** (feature-space) and the alpha-channel resize uses
-> **bicubic** — neither uses Lanczos. A **Lanczos (LANCZOS)** filter is used in
-> exactly one place: the final **crop-to-fill resize** that makes the finished 4×
-> image *exactly* cover the configured target dimensions (default **8000 × 5000**)
-> before a centered crop trims the excess.
-> See [Section 6 — Resampling Logic](#6-resampling-in-this-project) for details
-> and rationale.
+> **bicubic**. In 2.0 a **Lanczos** filter is used only when the requested size
+> differs from the network's exact 4× result — always with one factor for both
+> axes (see [Section 16.3](#163-size-planning)).
+> See [Section 6 — Resampling Logic](#6-resampling-in-this-project) for the
+> network-side details.
 
 ---
 
@@ -43,6 +52,7 @@ cloud API). See [Section 14 — Metadata Generator](#14-metadata-generator).
 13. [Troubleshooting](#13-troubleshooting)
 14. [Metadata Generator](#14-metadata-generator)
 15. [License & Credits](#15-license--credits)
+16. [Upscaler 2.0 (Django)](#16-upscaler-20-django)
 
 ---
 
@@ -926,3 +936,143 @@ never require Ollama to be installed.
 
 [official release]: https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.1.0
 [xinntao/Real-ESRGAN]: https://github.com/xinntao/Real-ESRGAN
+
+---
+
+## 16. Upscaler 2.0 (Django)
+
+Version 2.0 replaces the upscaler with a new implementation written from scratch
+in Python and Django. It neither imports nor modifies the 1.x upscaler modules.
+Its one rule: **every image keeps its aspect ratio and its whole picture**, unless
+the user explicitly chooses otherwise for an exact output size.
+
+### 16.1 How it fits into the desktop app
+
+```
+MainWindow (PySide6, top navigation)
+ ├─ Upscaler ─ UpscalerWebPage            app/ui/upscaler_web_page.py
+ │     QWebEngineView ⇄ http://127.0.0.1:<free port>/      (launch cookie + CSRF)
+ │     lends the page: native file/folder dialogs, message boxes,
+ │     Explorer drag & drop, the Qt palette/font (so both screens match)
+ │            │
+ │     Django project  app/web   settings · urls · middleware (launch token) · server
+ │       └─ Django app app/upscaler
+ │            views ─ forms ─ workspace (queue + batch thread) ─ engine / imaging / geometry
+ └─ Metadata ─ MetadataPage (native Qt, unchanged, no link to the upscaler)
+```
+
+- **Embedded server.** `app/web/server.py` starts Django's threaded WSGI server on
+  `127.0.0.1` with an OS-chosen port, in daemon threads of the app process, the
+  first time the Upscaler screen is shown. CSS/JS are served by Django's
+  `StaticFilesHandler`. Closing the window cancels a running batch (3 s grace)
+  and stops the server.
+- **No database.** The queue and the batch live in memory (`Workspace`), like the
+  rest of the desktop UI.
+- **Security.** The API takes file paths and writes files, so: a fresh
+  `SECRET_KEY` and launch token every launch; the shell opens `/?launch=<token>`,
+  which is exchanged for an `HttpOnly`, `SameSite=Strict` cookie required on every
+  request (`app/web/middleware.py`); Django CSRF protection on all POSTs;
+  `ALLOWED_HOSTS = 127.0.0.1, localhost` (blocks DNS rebinding); `X-Frame-Options: DENY`.
+- **Native pieces.** Views ask the desktop through `app/upscaler/host.py`. Requests
+  run on server threads, so `_GuiThreadBridge` hands each dialog to the GUI thread
+  with a blocking queued signal. Explorer drops are caught by the Qt widget, which
+  knows the real paths, and passed to the page with `runJavaScript`.
+- **Fallbacks.** Without Qt WebEngine the screen offers *Open Upscaler in Browser*
+  (same page; dialogs still open from the app). `python manage.py runserver`
+  serves the page standalone for development, with typed paths instead of dialogs.
+- **Startup.** `app/main.py` imports `QtWebEngineWidgets` before creating
+  `QApplication`, as Qt requires. The web view is created lazily, so building the
+  window headless (e.g. the Metadata tests) starts no browser and no server.
+
+### 16.2 Modules
+
+| Module | Responsibility |
+|---|---|
+| `app/upscaler/geometry.py` | Pure size planning: `SizeOptions` → `Plan(source, output, content, offset, fit, conflict)`, plus the human descriptions shown in the queue |
+| `app/upscaler/imaging.py` | EXIF-aware probe/load (16-bit → 8-bit, alpha split, RGB ICC profile kept), `compose()` (alpha merge, uniform Lanczos resize, pad or crop), atomic `save()`, `saved_size()` |
+| `app/upscaler/network.py` | RRDBNet x4plus (23 RRDB blocks, two nearest + conv 2× stages); layer names match the official checkpoint for `strict=True` loading |
+| `app/upscaler/engine.py` | Weight download/cache (`models/RealESRGAN_x4plus.pth`, shared with 1.x), device choice with CPU fallback, fp16, overlapping tiles into a uint8 canvas, cancel between tiles, CUDA out-of-memory → halve tile and retry |
+| `app/upscaler/files.py` | Recursive scan skipping `<folder>/upscaled/`, folder-mode output paths, `(1)` collision names, batch-rename numbering |
+| `app/upscaler/workspace.py` | Queue (`QueueItem`), `Job` thread (load model once, per-image pipeline, progress/log/results, cancel), `Workspace` singleton |
+| `app/upscaler/forms.py` | `UpscaleForm`: field validation plus the shape rule (pad/crop required on a conflict), JPEG transparency and 65,500 px limits; settings greyed out for the current choices aren't validated |
+| `app/upscaler/views.py`, `urls.py` | The page and its JSON API (16.5) |
+| `app/upscaler/templates/`, `static/` | The page: HTML, Fusion-style CSS (colours from the Qt palette, light and dark), vanilla JS client |
+| `app/web/*` | Django project: settings, root URLs, launch-token middleware, embedded server |
+| `app/ui/upscaler_web_page.py` | Qt host widget: lazy start, web view, GUI-thread bridge, drag & drop, palette export, shutdown |
+
+### 16.3 Size planning
+
+**Scale (default 4×, 1–8×).** `output = (round(w·f), round(h·f))` with the *same* `f`,
+rounding half up. Nothing is cropped or padded.
+
+**Exact W × H.** If one factor `s` rounds the image to exactly W × H on both axes
+(the same pixel rounding scale mode uses, so e.g. 1920 × 1080 → 5005 × 2815 counts),
+the image already has the frame's shape and is simply resized. Otherwise the shapes
+conflict, and the plan stays **unresolved**. The form refuses to start a
+batch, and `compose()` refuses to produce pixels, until the user picks:
+
+- **Pad** — resize by `fit` (the whole picture is kept) and centre it on a W × H
+  canvas, with white, black or transparent borders (transparent only for PNG);
+- **Crop** — resize by `fill = max(W/w, H/h)` and trim the overflow equally from both
+  sides.
+
+There is no stretch mode. The preview the page shows is computed by this same
+module. Each batch re-plans every image from the pixels it actually loads, and
+every saved file is re-opened to confirm it has the planned size.
+
+| Source | Setting | Output | What happens |
+|---|---|---|---|
+| 1024 × 1536 (2:3) | Scale 4× | **4096 × 6144** | same shape, whole picture |
+| 1536 × 1024 (3:2) | Scale 4× | **6144 × 4096** | same shape, whole picture |
+| 1024 × 1536 | Exact 2000 × 3000 | 2000 × 3000 | same shape — no choice needed |
+| 1024 × 1536 | Exact 8000 × 5000, no choice | — | blocked: "choose Pad or Crop" |
+| 1024 × 1536 | Exact 8000 × 5000, Pad | 8000 × 5000 | picture 3333 × 5000 + 2333/2334 px side borders |
+| 1024 × 1536 | Exact 8000 × 5000, Crop | 8000 × 5000 | filled 8000 × 12000, 3500 px trimmed top and bottom (58 % lost) |
+| 1536 × 1024 | Exact 8000 × 5000, Pad | 8000 × 5000 | picture 7500 × 5000 + 250 px side borders |
+
+### 16.4 Per-image pipeline
+
+1. `imaging.load()` — EXIF orientation applied (a phone portrait stays portrait), alpha split off.
+2. `plan_size()` — from the loaded size; an unresolved conflict fails that image with a clear message.
+3. `RealESRGAN.upscale()` — exactly 4× on both axes (checked).
+4. `imaging.compose()` — alpha (bicubic) merged; one Lanczos resize to the plan's content size if it isn't 4×; pad or crop if the plan says so.
+5. `imaging.save()` — written to `name.ext.part` and renamed (no half-written files); JPEG flattens alpha onto white.
+6. `saved_size()` must equal the plan, and the log line records every step:
+   `[OK] portrait.png: 1024x1536 -> 4096x6144 (Scaled 4× on both sides — same 2:3 shape, whole picture kept) -> …\portrait_x4.png`
+
+### 16.5 JSON API (all under the page origin)
+
+| Method & path | Purpose |
+|---|---|
+| `GET /` | The page (sets the CSRF cookie) |
+| `GET api/state/` | Queue + current batch |
+| `POST api/queue/add/` · `remove/` · `clear/` | Edit the queue (`paths` / `ids`) |
+| `POST api/plan/` | Validate settings; per image: output size, note, warnings, pad/crop alternatives |
+| `POST api/dialog/images/` · `folder/` · `output/` · `message/` | Native dialogs via the desktop host (501 without one) |
+| `POST api/jobs/` | Start a batch (400 with field errors, 409 if one is running) |
+| `GET api/jobs/current/?since=N` | Progress, phase, new log lines since N, per-image results |
+| `POST api/jobs/current/cancel/` | Cancel (between tiles / images) |
+
+### 16.6 User-facing behaviour
+
+Kept from 1.x: queue with Add Images / Add Folder / Remove Selected / Clear and
+drag & drop; output folder or *Save beside each original*; folder mode
+(`<folder>/upscaled/…`, structure preserved, `upscaled` skipped on rescans); Device /
+fp16 / tile size defaults from the CUDA probe; png/jpg + quality; filename suffix;
+batch rename; never overwriting; model loaded once per batch; Start / Cancel,
+progress bar, log, model-ready hint and completion dialogs.
+
+New: the **Output size** group (Scale by / Exact size); output size and an
+explanation for every queued image before processing; a shape diagram for the
+selected image; the conflict box with Pad and Crop diagrams and the exact pixels
+added or lost; *Match selected image's shape*; a suffix that follows the size
+(`_x4`, `_x2.5`, `_800x500`) until edited; cancel between tiles; automatic
+out-of-memory retry; RGB colour profiles kept.
+
+### 16.7 Testing
+
+| Command | Covers |
+|---|---|
+| `python -m tests.upscaler_test` | No model: planning for many shapes and factors; form rules; launch token, CSRF and host checks; batches writing real files for portrait 1024 × 1536, landscape 1536 × 1024 and an EXIF portrait (exact size, aspect ratio, and the output shrunk back must reproduce the source with each corner marker in its corner); 2.5×; exact size blocked → pad → crop; folder mode, alpha, ICC, no-overwrite, batch rename, cancel; no dependency on the 1.x upscaler |
+| `python -m tests.upscaler_model_test [--example]` | The real network on portrait, landscape, EXIF-rotated and transparent images at 4×, 2× and an exact size with pad/crop; outputs must line up with the source at zero offset (PSNR check) — `--example` adds 1024 × 1536 → 4096 × 6144 |
+| `python -m tests.upscaler_desktop_test` | The real window offscreen: lazy server, dialogs on the GUI thread, drag & drop, and clicking through the embedded page (conflict blocks Start until Pad is chosen) |

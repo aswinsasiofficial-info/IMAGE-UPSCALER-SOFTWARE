@@ -1,7 +1,8 @@
 """PySide6 main window — hosts the feature screens behind top navigation.
 
 Two independent features, two pages:
-  * Upscaler  — the original batch image upscaling screen (app/ui/upscale_page.py)
+  * Upscaler  — the Django-based upscaler (app/upscaler), shown through
+                app/ui/upscaler_web_page.py
   * Metadata  — the Adobe-ready metadata generator (app/ui/metadata_page.py)
 
 They share no pipeline: upscaling saves files to disk, and the Metadata page
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
     QToolBar,
 )
 
-from app.ui.upscale_page import UpscalePage
+from app.ui.upscaler_web_page import UpscalerWebPage
 from app.ui.metadata_page import MetadataPage
 
 
@@ -48,7 +49,7 @@ class MainWindow(QMainWindow):
         self._info = cuda_info()
 
         # Feature pages (each one self-contained with its own worker thread).
-        self.upscale_page = UpscalePage(self._info)
+        self.upscale_page = UpscalerWebPage(self._info)
         self.metadata_page = MetadataPage()
         self.stack = QStackedWidget()
         self.stack.addWidget(self.upscale_page)
@@ -101,7 +102,8 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "About",
             "<b>Batch Image Upscaler + Metadata Generator</b><br>"
-            "Upscaler: Real-ESRGAN x4plus · PyTorch + CUDA · local 4x super-resolution.<br>"
+            "Upscaler: Real-ESRGAN x4plus · PyTorch + CUDA · Django · local AI upscaling "
+            "that keeps every image's shape and whole picture.<br>"
             "Metadata: Adobe-ready titles/descriptions/keywords via Gemini, Groq "
             "or Ollama (local server / hosted cloud).<br><br>"
             "The two features are independent: upscale and save first, then open "
