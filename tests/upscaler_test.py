@@ -14,6 +14,7 @@ upscaler code.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -364,17 +365,24 @@ def test_page() -> None:
     r = c.get("/")
     assert r.status_code == 200
     html = r.content.decode()
-    for text in ("Images to process", "Add Images…", "Add Folder…", "Remove Selected",
-                 "Save beside each original", "Half precision (fp16)", "Tile size (px):",
-                 "Scale by", "Exact size", "Pad to fit", "Crop to fill", "Filename suffix:",
-                 "Rename batch", "Start Upscaling", "Cancel"):
+    for text in ("Images", "Add Images…", "Add Folder…", "Remove Selected", "Output size",
+                 "Save to", "Processing", "Save beside each original", "Half precision (fp16)",
+                 "Tile size (px)", "Scale by", "Exact size", "Pad to fit", "Crop to fill",
+                 "Filename suffix", "Rename batch", "Start Upscaling", "Cancel", "Activity log",
+                 'id="preview-frame"'):
         assert text in html, text
+    # The page uses the same design tokens as the desktop screens, light and dark.
+    from app import design
+    assert design.css_variables(design.LIGHT) in html and design.css_variables(design.DARK) in html
+    assert "data-theme" not in html.split("<head>")[0]        # no host: the browser decides
     cfg = json.loads(re.search(r'id="upscaler-config"[^>]*>(.*?)</script>', html, re.S).group(1))
     assert cfg["defaults"]["size_mode"] == "scale" and cfg["defaults"]["scale_factor"] == "4"
     assert cfg["defaults"]["fit"] == ""                 # no silent default for pad/crop
     assert "8000" not in html and "5000" not in html    # the fixed-shape target is gone
     for asset in ("/static/upscaler/upscaler.css", "/static/upscaler/upscaler.js"):
         assert asset in html
+        # Served by Django itself too, so `manage.py runserver` works without DEBUG.
+        assert c.get(asset).status_code == 200, asset
     print("  page OK")
 
 
@@ -397,6 +405,23 @@ def test_batches(tmp: Path) -> None:
     assert sizes == {"portrait.png": (1024, 1536, "portrait"),
                      "landscape.png": (1536, 1024, "landscape"),
                      "phone.jpg": (300, 450, "portrait")}, sizes
+
+    # Every queued image has a small thumbnail and a larger preview, upright
+    # (EXIF applied) and with its own proportions.
+    for q in queue:
+        for kind, edge in (("thumb", 160), ("preview", 960)):
+            r = api.get(f"/api/{kind}/{q['id']}/")
+            assert r.status_code == 200 and r["Content-Type"] == "image/webp", (kind, r.status_code)
+            assert "max-age" in r["Cache-Control"]
+            with Image.open(io.BytesIO(r.content)) as im:
+                w, h = im.size
+            assert max(w, h) == min(edge, max(q["width"], q["height"])), (kind, q["name"], w, h)
+            assert abs(w / h - q["width"] / q["height"]) < 0.02, (kind, q["name"], w, h)
+            if kind == "thumb":
+                assert len(r.content) < 20_000, len(r.content)
+            again = api.get(f"/api/{kind}/{q['id']}/")
+            assert again.content == r.content                    # served from the cache
+    assert api.get("/api/thumb/nope/").status_code == 404
 
     # The preview shows every expected output size before anything runs.
     plan = api.post("/api/plan/", {"settings": _settings(output_dir=str(out))}).json()

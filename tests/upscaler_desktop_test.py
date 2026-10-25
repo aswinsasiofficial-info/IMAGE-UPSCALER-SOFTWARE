@@ -100,6 +100,7 @@ def post_from_thread(app: QApplication, client: Http, path: str, body: dict) -> 
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     from app.ui.main_window import MainWindow
+    from app.ui import theme
     from app.ui.metadata_page import MetadataPage
     from app.ui.upscaler_web_page import UpscalerWebPage
 
@@ -131,9 +132,12 @@ def main() -> int:
         assert pump(app, lambda: server._active is not None, 5)
         page: UpscalerWebPage = win.upscale_page
         client = Http(server._active.launch_url, server._active.url)
-        assert "Start Upscaling" in client.page and "--window:#" in client.page
+        from app import design
+        scheme = theme.current_scheme()
+        assert "Start Upscaling" in client.page and f'data-theme="{scheme}"' in client.page
+        assert design.css_variables(design.LIGHT) in client.page
         print(f"  local Django server at {server._active.url} (launch token + CSRF), "
-              "Qt palette passed to the page")
+              f"shared design tokens, desktop scheme '{scheme}' passed to the page")
 
         # Native dialogs, requested from a Django request thread.
         main_thread = threading.main_thread()
@@ -176,13 +180,22 @@ def main() -> int:
             print("  Explorer drop -> queue OK (direct path)")
         else:
             assert run_js(app, view, "document.getElementById('btn-start').textContent") == "Start Upscaling"
-            outs_js = ("[...document.querySelectorAll('#queue-body td.out')]"
-                       ".map(td => td.textContent).join('|')")
+            outs_js = ("[...document.querySelectorAll('.queue-row .out-dims .v')]"
+                       ".map(node => node.textContent).join('|')")
             # Rows appear first; the planned sizes follow from the (debounced) plan request.
             assert pump(app, lambda: run_js(app, view, outs_js) == "256 × 384|384 × 256", 10), \
                 run_js(app, view, outs_js)
             outs = run_js(app, view, outs_js)
-            print(f"  page loaded in Qt WebEngine; previewed outputs: {outs}")
+            # Every row shows its own thumbnail; the selected image shows a large preview.
+            thumbs_js = ("JSON.stringify([...document.querySelectorAll('.queue-row img.thumb')]"
+                         ".map(img => img.complete && img.naturalWidth > 0 && img.naturalHeight > 0))")
+            assert pump(app, lambda: run_js(app, view, thumbs_js) == "[true,true]", 10), \
+                run_js(app, view, "JSON.stringify([...document.querySelectorAll('.queue-row img.thumb')]"
+                                  ".map(i => [i.src, i.complete, i.naturalWidth, i.className, i.loading]))")
+            preview_js = ("(() => { const img = document.querySelector('#preview-frame img.pic');"
+                          " return !!img && img.complete && img.naturalHeight > img.naturalWidth; })()")
+            assert pump(app, lambda: run_js(app, view, preview_js) is True, 10), "no large preview"
+            print(f"  page loaded in Qt WebEngine; thumbnails + large preview shown; outputs: {outs}")
 
             # Explorer drop on the page -> JS -> Django.
             mime = _mime(dropped)      # the event doesn't own it: keep it alive
@@ -190,7 +203,7 @@ def main() -> int:
                                       Qt.LeftButton, Qt.NoModifier))
             assert pump(app, lambda: any(i.path == dropped for i in get_workspace().items), 10)
             assert pump(app, lambda: run_js(app, view,
-                        "document.querySelectorAll('#queue-body tr').length") == 3, 10)
+                        "document.querySelectorAll('.queue-row').length") == 3, 10)
             print("  Explorer drop -> page -> Django queue OK")
 
             out_dir = tmp / "out"

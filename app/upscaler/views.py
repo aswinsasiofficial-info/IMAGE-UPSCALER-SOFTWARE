@@ -8,15 +8,17 @@ very code that later writes the files.
 from __future__ import annotations
 
 import json
-import re
 
-from django.http import JsonResponse
+from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.urls import reverse
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 
+from app import design
+
 from . import host as desktop
+from . import previews
 from .engine import WEIGHTS_FILE, probe_device, recommended_tile, weights_ready
 from .files import DEFAULT_OUTPUT_DIR, OUTPUT_DIR_NAME
 from .forms import UpscaleForm
@@ -24,12 +26,6 @@ from .geometry import (CROP, DEFAULT_FACTOR, LARGE_OUTPUT_MP, MAX_FACTOR, MAX_SI
                        MODEL_SCALE, PAD, SCALE, Plan, SizeOptions, describe, orientation,
                        plan_size, ratio_label)
 from .workspace import AddResult, Busy, QueueItem, get_workspace
-
-_THEME_VALUE = {
-    "color": re.compile(r"^#[0-9a-fA-F]{6}$"),
-    "font-family": re.compile(r"^[\w .\-]{1,64}$"),
-    "font-size": re.compile(r"^\d{1,2}(\.\d{1,2})?pt$"),
-}
 
 
 # -- helpers ------------------------------------------------------------------
@@ -53,15 +49,11 @@ def _error(status: int, message: str, **extra) -> JsonResponse:
     return JsonResponse({"error": message, **extra}, status=status)
 
 
-def _theme_css(theme: dict[str, str]) -> str:
-    """CSS custom properties from the host palette (validated — it lands in a <style>)."""
-    rules = []
-    for name, value in theme.items():
-        kind = name if name in _THEME_VALUE else "color"
-        if not re.fullmatch(r"[a-z\-]{1,32}", name) or not _THEME_VALUE[kind].match(value):
-            continue
-        rules.append(f'--{name}:"{value}";' if name == "font-family" else f"--{name}:{value};")
-    return "".join(rules)
+def _scheme(host) -> str:
+    """The desktop's light/dark choice, or "" to let the browser decide."""
+    if host is None:
+        return ""
+    return design.normalize_scheme((host.theme() or {}).get("scheme"))
 
 
 def _queue_json(items: list[QueueItem]) -> list[dict]:
@@ -166,7 +158,6 @@ def _no_host() -> JsonResponse:
 @ensure_csrf_cookie
 def index(request):
     host = desktop.current()
-    theme = host.theme() if host else {}
     device = probe_device()
     config = {
         "api": reverse("upscaler:index") + "api/",
@@ -190,9 +181,35 @@ def index(request):
     }
     return render(request, "upscaler/index.html", {
         "config": config,
-        "theme_css": _theme_css(theme),
-        "scheme": theme.get("scheme", "") if theme else "",
+        # Same tokens as the Qt screens (app/design.py); values are our own constants.
+        "light_css": design.css_variables(design.LIGHT),
+        "dark_css": design.css_variables(design.DARK),
+        "scheme": _scheme(host),
+        "font_stack": design.FONT_STACK,
     })
+
+
+def _image(request, item_id: str, edge: int) -> HttpResponse:
+    item = get_workspace().find(item_id)
+    if item is None:
+        raise Http404("Not in the queue")
+    try:
+        data = previews.image_bytes(item.path, edge)
+    except Exception as exc:          # unreadable/removed file: the page shows a placeholder
+        raise Http404(str(exc)) from exc
+    response = HttpResponse(data, content_type="image/webp")
+    response["Cache-Control"] = "private, max-age=3600"
+    return response
+
+
+@require_GET
+def thumbnail(request, item_id: str):
+    return _image(request, item_id, previews.THUMB_EDGE)
+
+
+@require_GET
+def preview(request, item_id: str):
+    return _image(request, item_id, previews.PREVIEW_EDGE)
 
 
 # -- queue --------------------------------------------------------------------

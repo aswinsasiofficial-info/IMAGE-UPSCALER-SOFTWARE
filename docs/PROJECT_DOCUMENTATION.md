@@ -119,8 +119,9 @@ d:\Upscaler\
 │   └── ui/
 │       ├── main_window.py           # shell: top navigation + stacked pages
 │       ├── upscale_page.py          # upscaler screen (behaviour unchanged)
-│       ├── metadata_page.py         # Metadata Generator screen
-│       └── metadata_review.py       # final review table + export options
+│       ├── metadata_page.py         # Metadata Generator screen (list, preview, editor, Export)
+│       ├── theme.py · thumbnails.py # shared design as Qt stylesheet · background thumbnails
+│       └── upscaler_web_page.py     # Upscaler screen (embeds the Django page)
 ├── models/
 │   └── RealESRGAN_x4plus.pth        # pretrained weights (~67 MB, auto-downloaded)
 ├── tests/
@@ -768,15 +769,17 @@ MetadataPage (app/ui/metadata_page.py)
       build_prompt()            JSON contract + language + keyword budget
       _call_gemini() | _call_groq() | _call_ollama()   provider dispatch, retry/backoff
       parse_model_json() + sanitize_metadata()   Adobe limits enforced
-  → item_done/item_failed → grid colour + editor panel (all fields editable)
+  → item_done/item_failed → list tile status + editor panel (all fields editable)
   → folder batch where EVERY image succeeded → write_csv() auto-exports
     metadata.csv into the selected folder (metadata_2.csv, … if one already
-    exists; never overwritten). Any failure or cancellation → no auto-export;
-    successful/failed rows stay in the list for Retry Failed
-  → ReviewDialog (app/ui/metadata_review.py)  read-only table + warnings
-  → exports:
-      write_csv()      Filename, Title, Description, Keywords (UTF-8 BOM)
-      embed_metadata() PNG tEXt chunks / JPEG COM comment — copies or in place
+    exists — files the app didn't write are never overwritten). Any failure or
+    cancellation → no auto-export; successful/failed rows stay in the list for
+    Retry Failed. The written file becomes Export's save location
+  → Export: write_csv() of every finished row, edits included (Filename, Title,
+    Description, Keywords, UTF-8 BOM) — asks for a location the first time,
+    then updates that file; Export As… picks another
+  → Export ▾ Embed Metadata into Images…: embed_metadata() PNG tEXt chunks /
+    JPEG COM comment — copies or in place, the user's explicit choice
 ```
 
 ### 14.2 Modules
@@ -788,13 +791,15 @@ MetadataPage (app/ui/metadata_page.py)
 | `app/engine/metadata_worker.py` | `MetadataWorker(QThread)`: loops the whole queue sequentially; emits `item_started(path, index, total)`/`item_done`/`item_failed` keyed by **full path** (same-named files in different folders stay distinct), plus `progress`/`finished_all`/`cancel` semantics identical to `BatchWorker`. A per-image failure never aborts the batch. Logs an explicit hosting notice per run (cloud = each image is uploaded to `https://ollama.com`; local = images stay on this computer). `OllamaLookupWorker(QThread)` runs the blocking connection/model check off the UI thread and reports back via `result(models, message)` |
 | `app/engine/metadata_export.py` | Contributor CSV (comma-joined keywords, `utf-8-sig` so Excel opens UTF-8) and in-file embedding: PNG `PngInfo` tEXt chunks, JPEG COM comment with a JSON payload (`quality="keep"` so pixels aren't re-degraded). Writes go to a temp file + `os.replace` so an in-place rewrite can never half-overwrite; non-PNG/JPEG raise a clear error |
 | `app/engine/credential_store.py` | API key resolution order: in-session (typed) → env var (`GEMINI_API_KEY` / `GROQ_API_KEY` / `OLLAMA_API_KEY`) → Windows Credential Manager via `keyring`, one entry **per provider** so credentials never leak across providers. Optional "Remember" persists to keyring; keys are never logged or exported. Keyless providers (local Ollama) short-circuit: `get_key()` returns `""` and `save_key()` refuses, so no credential is ever required or stored for a local server |
-| `app/ui/metadata_page.py` | The screen: grid preview + provider/model/key/language/keyword-count options, editor panel for the selected tile, per-image status, **Generate Metadata / Retry Failed / Regenerate Selected**, and **Review & Export…**. Switching provider swaps the model catalogue, hides the key field for local Ollama, shows the server-address field + **Check Connection & Vision Models** button for both Ollama modes, and prints a plain-language notice about where images go (hosted upload vs local only); the check runs on `OllamaLookupWorker` and refills the editable model box with the image-capable models actually available. Remembers folder selections (Add Folder… / dropped folders) and auto-exports the CSV into each touched folder root only when every image under that root has metadata (all-or-nothing, incl. across retry runs); file-only batches keep the manual flow until an export folder was chosen in Review & Export |
-| `app/ui/metadata_review.py` | Final review step: read-only table of every row, warnings (missing titles, non-embeddable formats), explicit export choices (CSV path; embed into copies vs in place) |
+| `app/ui/metadata_page.py` | The screen: image list (thumbnail, filename, status, keyword count, title or error per tile; All/Pending/Done/Failed filters with counts), large preview + editor for the selected image (counters against Adobe limits), Provider and Output cards, action bar with progress, **Generate Metadata / Retry Failed / Regenerate Selected / Cancel** and **Export ▾** (Export As…, Embed Metadata into Images…), an inline result banner and a collapsible activity log. Responsive: three columns ≥ 1180 px, list + tabs below that, stacked under 700 px. Thumbnails come from `app/ui/thumbnails.py` (background, on first paint, cached). Switching provider swaps the model catalogue, hides the key field for local Ollama, shows the server-address field + **Check Connection & Vision Models** button for both Ollama modes, and prints a plain-language notice about where images go (hosted upload vs local only); the check runs on `OllamaLookupWorker` and refills the editable model box with the image-capable models actually available. Remembers folder selections (Add Folder… / dropped folders) and auto-exports the CSV into each touched folder root only when every image under that root has metadata (all-or-nothing, incl. across retry runs); file-only batches are saved with Export |
 
 ### 14.3 UI behaviour
 
-- Grid tiles are colour-coded: grey = pending, yellow = generating, green =
-  done, red = failed (error text in the tooltip and the status line).
+- Each list tile shows the image's thumbnail, filename and a coloured status
+  (grey = not generated, blue = generating, green = done with keyword count,
+  red = failed) above its title — or, for a failure, the error. The selected
+  image appears large in the editor with its folder and status; filters narrow
+  the list to Pending / Done / Failed.
 - Every generated field is editable at any time; edits persist into the row
   model and are what gets exported (generation results never auto-overwrite
   manual edits mid-run for the item being edited). Selecting a different tile
@@ -822,11 +827,14 @@ MetadataPage (app/ui/metadata_page.py)
   generated metadata**. If any image fails or the batch is cancelled, no CSV
   is written; successful rows and failed-image statuses stay visible in the
   list so `Retry Failed` can re-run only the failures, and once all images
-  succeed the complete CSV is saved automatically. **File-only** batches keep
-  the manual Review & Export flow and auto-export only after an export folder
-  was chosen there once.
-- Embedding always remains behind the review dialog — in-file rewrites never
-  happen automatically.
+  succeed the complete CSV is saved automatically, and a banner says where.
+  **File-only** batches are saved with **Export**.
+- **Export** writes the current metadata, edits included, for every image that
+  has metadata (images without it are left out and counted in the banner). It
+  asks where to save the first time and then keeps updating that file — the
+  label next to the button shows which; *Export As…* chooses another.
+- Embedding is only ever done on request (Export ▾ → Embed Metadata into
+  Images…, copies or in place) — in-file rewrites never happen automatically.
 
 ### 14.4 Ollama modes — setup and limits
 

@@ -5,8 +5,9 @@ server in this process (app/web/server.py). This widget shows it in an
 embedded Chromium view (Qt WebEngine) under the same top navigation as the
 Metadata screen, and lends it what a web page can't do alone: native file
 and folder dialogs that return real paths, Windows message boxes, drag & drop
-from Explorer, and the app's Qt palette so both screens look alike. If Qt
-WebEngine is missing, it offers to open the same page in the default browser.
+from Explorer, and the app's light/dark scheme (the page renders the same
+design tokens as the Qt screens, app/design.py). If Qt WebEngine is missing,
+it offers to open the same page in the default browser.
 
 Nothing starts until the screen is first shown, so building the main window
 stays cheap (and headless tests that never show it start no server).
@@ -20,9 +21,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import QEvent, QObject, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QPalette
+from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
-    QApplication,
     QFileDialog,
     QLabel,
     QMessageBox,
@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import design
+from app.ui import theme
 from app.upscaler.files import IMAGE_SUFFIXES
 from app.upscaler.workspace import get_workspace
 from app.web import server
@@ -66,37 +68,18 @@ class _GuiThreadBridge(QObject):
             box["error"] = exc
 
 
-def palette_theme() -> dict[str, str]:
-    """The app's Qt palette and font as CSS custom properties for the page."""
-    pal = QApplication.palette()
-    role = QPalette.ColorRole
-    # Only the base roles: the page derives borders and muted text itself, since
-    # roles like Dark/PlaceholderText are unusable on Windows' dark palette.
-    roles = {
-        "window": role.Window, "window-text": role.WindowText, "base": role.Base,
-        "text": role.Text, "button": role.Button, "button-text": role.ButtonText,
-        "highlight": role.Highlight, "highlighted-text": role.HighlightedText,
-    }
-    theme = {name: pal.color(QPalette.ColorGroup.Active, r).name() for name, r in roles.items()}
-    theme["disabled-text"] = pal.color(QPalette.ColorGroup.Disabled, role.Text).name()
-    font = QApplication.font()
-    theme["font-family"] = font.family()
-    if font.pointSizeF() > 0:
-        theme["font-size"] = f"{font.pointSizeF():g}pt"
-    theme["scheme"] = "dark" if pal.color(role.Window).lightness() < 128 else "light"
-    return theme
-
-
 class _DesktopHost:
     """What the Django views may ask of the desktop (see app/upscaler/host.py)."""
 
     def __init__(self, page: QWidget, bridge: _GuiThreadBridge) -> None:
         self._page = page
         self._bridge = bridge
-        self._theme = palette_theme()     # read once here, on the GUI thread
+        # Kept as a plain attribute (set on the GUI thread) so Django's request
+        # threads never touch Qt objects to read it.
+        self.scheme = theme.current_scheme()
 
     def theme(self) -> dict[str, str]:
-        return dict(self._theme)
+        return {"scheme": self.scheme}
 
     def pick_images(self) -> list[str]:
         def ask() -> list[str]:
@@ -126,6 +109,7 @@ class UpscalerWebPage(QWidget):
         super().__init__(parent)
         self._info = info                 # CUDA probe the main window already made
         self._bridge = _GuiThreadBridge()
+        self._host = _DesktopHost(self, self._bridge)
         self._server: Optional[server.LocalServer] = None
         self.view = None                  # QWebEngineView once started
         self.setAcceptDrops(True)
@@ -145,13 +129,22 @@ class UpscalerWebPage(QWidget):
     def start(self) -> str:
         """Start the local Django server (once) and show its page; returns the URL."""
         if self._server is None:
-            self._server = server.start(host=_DesktopHost(self, self._bridge))
+            self._host.scheme = theme.current_scheme()
+            self._server = server.start(host=self._host)
             self._show_page(self._server.launch_url)
         return self._server.launch_url
 
     @property
     def url(self) -> Optional[str]:
         return self._server.url if self._server else None
+
+    def set_scheme(self, scheme: str) -> None:
+        """Follow a light/dark switch of the desktop without reloading the page."""
+        self._host.scheme = design.normalize_scheme(scheme)
+        if self.view is not None:
+            self.view.page().setBackgroundColor(QColor(design.colors(scheme)["bg"]))
+            self.view.page().runJavaScript(
+                f"document.documentElement.dataset.theme = {json.dumps(self._host.scheme)};")
 
     def _show_page(self, url: str) -> None:
         try:
@@ -160,6 +153,8 @@ class UpscalerWebPage(QWidget):
             self._show_browser_fallback(url, exc)
             return
         view = QWebEngineView(self)
+        # No white flash before the page paints in dark mode.
+        view.page().setBackgroundColor(QColor(design.colors(self._host.scheme)["bg"]))
         # Explorer drops are taken by this widget (it knows the real paths).
         view.setAcceptDrops(False)
         view.setContextMenuPolicy(Qt.NoContextMenu)

@@ -12,28 +12,31 @@
   const POLL_MS = 350;
 
   const el = {
-    queueList: $("queue-list"), queueBody: $("queue-body"), queueEmpty: $("queue-empty"),
-    preview: $("shape-preview"), previewDiagram: $("preview-diagram"),
-    previewTitle: $("preview-title"), previewDims: $("preview-dims"), previewNote: $("preview-note"),
+    queueList: $("queue-list"), queueEmpty: $("queue-empty"), queueCount: $("queue-count"),
+    previewFrame: $("preview-frame"), previewTitle: $("preview-title"),
+    previewDims: $("preview-dims"), previewNote: $("preview-note"),
     outputDir: $("output-dir"), saveBeside: $("save-beside"), folderHint: $("folder-hint"),
     device: $("device"), fp16: $("fp16"), tile: $("tile"),
     modeScale: $("mode-scale"), modeExact: $("mode-exact"), factor: $("scale-factor"),
     exactW: $("exact-width"), exactH: $("exact-height"), match: $("btn-match"),
     summary: $("size-summary"), conflict: $("conflict-box"), conflictText: $("conflict-text"),
     diagramPad: $("diagram-pad"), diagramCrop: $("diagram-crop"),
-    detailPad: $("detail-pad"), detailCrop: $("detail-crop"),
-    padColorRow: $("pad-color-row"), padColor: $("pad-color"),
+    detailPad: $("detail-pad"), detailCrop: $("detail-crop"), padColor: $("pad-color"),
     format: $("output-format"), quality: $("jpg-quality"), suffix: $("suffix"), rename: $("rename-batch"),
     start: $("btn-start"), cancel: $("btn-cancel"), status: $("status"),
     progress: $("progress"), progressChunk: $("progress-chunk"), progressText: $("progress-text"),
-    log: $("log"),
+    log: $("log"), logCount: $("log-count"),
     addImages: $("btn-add-images"), addFolder: $("btn-add-folder"),
     remove: $("btn-remove"), clear: $("btn-clear"), browse: $("btn-browse"),
   };
+  el.rows = document.createElement("div");
+  el.rows.className = "rows";
+  el.queueList.append(el.rows);
 
   const state = {
     queue: [],              // items from the server
     rows: new Map(),        // id -> planned output for the current settings
+    rowEls: new Map(),      // id -> row element (kept, so thumbnails never reload)
     plan: null,             // last plan response
     selected: new Set(),
     anchor: null,
@@ -44,6 +47,7 @@
     fitKey: "",             // frame + mismatched images the Pad/Crop choice was made for
     fitPending: false,
     logNext: 0,
+    logLines: 0,
     autoSuffix: config.defaults.suffix,
     planTimer: 0,
     planSeq: 0,
@@ -76,15 +80,26 @@
     return data;
   }
 
+  const thumbUrl = (id) => `${config.api}thumb/${encodeURIComponent(id)}/`;
+  const previewUrl = (id) => `${config.api}preview/${encodeURIComponent(id)}/`;
+
   // -- small helpers ----------------------------------------------------------
   const dims = (wh) => `${wh[0]} × ${wh[1]}`;
   const roundHalfUp = (x) => Math.floor(x + 0.5);
   const formatFactor = (f) => String(Math.round(f * 100) / 100);
+  const make = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
 
   function log(text) {
     const atBottom = el.log.scrollTop + el.log.clientHeight >= el.log.scrollHeight - 4;
     el.log.append(document.createTextNode(text + "\n"));
     while (el.log.childNodes.length > LOG_LINES) el.log.firstChild.remove();
+    state.logLines += 1;
+    el.logCount.textContent = `(${state.logLines})`;
     if (atBottom) el.log.scrollTop = el.log.scrollHeight;
   }
 
@@ -168,7 +183,7 @@
     el.suffix.value = d.suffix;
     el.rename.checked = d.rename_batch;
     el.folderHint.textContent =
-      `Folders added with "Add Folder…" always save to <folder>/${config.output_dir_name}/, ` +
+      `Images from "Add Folder…" always save to <folder>/${config.output_dir_name}/, ` +
       "keeping each image's subfolder path.";
   }
 
@@ -190,7 +205,7 @@
   function updateControls() {
     const r = state.running;
     const exact = sizeMode() === "exact";
-    for (const node of document.querySelectorAll(".settings-panel input, .settings-panel select, .settings-panel button")) {
+    for (const node of document.querySelectorAll(".settings input, .settings select, .settings button")) {
       node.disabled = r;
     }
     if (!r) {
@@ -203,7 +218,8 @@
       el.suffix.disabled = el.rename.checked;
       el.padColor.disabled = fitChoice() !== "pad";
     }
-    for (const b of [el.addImages, el.addFolder, el.clear]) b.disabled = r;
+    for (const b of [el.addImages, el.addFolder]) b.disabled = r;
+    el.clear.disabled = r || !state.queue.length;
     el.remove.disabled = r || state.selected.size === 0;
     el.start.disabled = r || state.starting;
     el.cancel.disabled = !r;
@@ -221,68 +237,66 @@
     return state.queue[0] || null;
   }
 
-  function statusCell(id) {
-    const res = state.results[id];
-    if (!res) return ["", ""];
-    switch (res.status) {
-      case "processing": return ["Processing…", ""];
-      case "done": return ["✓ Saved", "status-done"];
-      case "failed": return ["✗ Failed", "status-failed"];
-      case "cancelled": return ["Cancelled", ""];
-      default: return ["", ""];
-    }
+  const STATUS = {
+    processing: ["Processing…", "processing"], done: ["Saved", "done"],
+    failed: ["Failed", "failed"], cancelled: ["Cancelled", "cancelled"],
+  };
+
+  function buildRow(item) {
+    const row = make("div", "queue-row");
+    row.dataset.id = item.id;
+    row.setAttribute("role", "option");
+    const img = make("img", "thumb");
+    img.alt = "";
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.src = thumbUrl(item.id);
+    img.addEventListener("error", () => img.classList.add("broken"));
+    const src = make("div", "cell");
+    src.append(make("div", "name", item.name), make("div", "src"));
+    const out = make("div", "cell out");
+    const outDims = make("div", "out-dims");
+    outDims.append(make("span", "arrow", "→"), make("span", "v"));
+    out.append(outDims, make("div", "note"));
+    row.append(img, src, out, make("span", "pill"));
+    return row;
+  }
+
+  function updateRow(rowEl, item) {
+    const row = state.rows.get(item.id);
+    rowEl.classList.toggle("selected", state.selected.has(item.id));
+    rowEl.setAttribute("aria-selected", state.selected.has(item.id) ? "true" : "false");
+    rowEl.classList.toggle("needs-choice", !!row && row.kind === "conflict");
+    rowEl.title = item.folder_root
+      ? `${item.path}\nFrom folder ${item.folder_root} — saves under its "${config.output_dir_name}" subfolder`
+      : item.path;
+    rowEl.querySelector(".src").textContent = `${dims([item.width, item.height])} · ${item.ratio} ${item.orientation}`;
+    rowEl.querySelector(".out-dims .v").textContent = row && row.output ? dims(row.output) : "—";
+    const note = rowEl.querySelector(".note");
+    note.textContent = row ? row.note : "";
+    if (row && row.warning) note.append(" ", make("span", "warning", row.warning));
+    const pill = rowEl.querySelector(".pill");
+    const res = state.results[item.id];
+    const [text, cls] = (res && STATUS[res.status]) || ["", ""];
+    pill.textContent = text;
+    pill.className = `pill ${cls}`;
+    pill.title = res ? (res.output || res.error || "") : "";
   }
 
   function renderQueue() {
-    const frag = document.createDocumentFragment();
-    for (const item of state.queue) {
-      const row = state.rows.get(item.id);
-      const tr = document.createElement("tr");
-      tr.dataset.id = item.id;
-      if (state.selected.has(item.id)) tr.classList.add("selected");
-      if (row && row.kind === "conflict") tr.classList.add("needs-choice");
-
-      const name = document.createElement("td");
-      name.className = "name";
-      name.textContent = item.name;
-      name.title = item.folder_root
-        ? `${item.path}\nFrom folder ${item.folder_root} — saves under its "${config.output_dir_name}" subfolder`
-        : item.path;
-
-      const src = document.createElement("td");
-      src.className = "dims";
-      src.textContent = dims([item.width, item.height]);
-      const shape = document.createElement("span");
-      shape.className = "shape muted";
-      shape.textContent = `${item.ratio} ${item.orientation}`;
-      src.append(shape);
-
-      const out = document.createElement("td");
-      out.className = "out";
-      out.textContent = row && row.output ? dims(row.output) : "—";
-
-      const note = document.createElement("td");
-      note.className = "note";
-      note.textContent = row ? row.note : "";
-      if (row && row.warning) {
-        const warn = document.createElement("span");
-        warn.className = "warning";
-        warn.textContent = row.warning;
-        note.append(warn);
-      }
-
-      const status = document.createElement("td");
-      const [text, cls] = statusCell(item.id);
-      status.className = `status ${cls}`;
-      status.textContent = text;
-      const res = state.results[item.id];
-      if (res) status.title = res.output || res.error || "";
-
-      tr.append(name, src, out, note, status);
-      frag.append(tr);
+    const ids = new Set(state.queue.map((i) => i.id));
+    for (const [id, rowEl] of state.rowEls) {
+      if (!ids.has(id)) { rowEl.remove(); state.rowEls.delete(id); }
     }
-    el.queueBody.replaceChildren(frag);
+    state.queue.forEach((item, index) => {
+      let rowEl = state.rowEls.get(item.id);
+      if (!rowEl) { rowEl = buildRow(item); state.rowEls.set(item.id, rowEl); }
+      if (el.rows.children[index] !== rowEl) el.rows.insertBefore(rowEl, el.rows.children[index] || null);
+      updateRow(rowEl, item);
+    });
     el.queueEmpty.hidden = state.queue.length > 0;
+    const n = state.queue.length;
+    el.queueCount.textContent = n ? `${n} image${n === 1 ? "" : "s"}${state.selected.size ? ` · ${state.selected.size} selected` : ""}` : "No images yet";
     renderPreview();
     updateControls();
   }
@@ -292,58 +306,84 @@
     const ids = new Set(queue.map((i) => i.id));
     for (const id of [...state.selected]) if (!ids.has(id)) state.selected.delete(id);
     if (state.anchor && !ids.has(state.anchor)) state.anchor = null;
+    if (!state.selected.size && queue.length) { state.selected.add(queue[0].id); state.anchor = queue[0].id; }
     if (!state.running) el.status.textContent = `${queue.length} image(s) queued`;
     renderQueue();
     schedulePlan();
   }
 
-  // -- shape diagrams -----------------------------------------------------------
-  function drawDiagram(box, geometry, fit, padColor) {
+  // -- result frames: the picture inside its output frame -------------------------
+  function drawFrame(box, geometry, fit, padColor, imageUrl) {
     box.replaceChildren();
-    if (!geometry) return;
+    if (!geometry) {
+      box.append(make("div", "placeholder", "Add an image to see how it will be saved."));
+      return;
+    }
     const small = box.classList.contains("small");
-    const W = small ? 84 : 96, H = small ? 60 : 72;
+    const W = box.clientWidth || (small ? 140 : 320);
+    const H = box.clientHeight || (small ? 66 : 200);
+    const margin = small ? 3 : 14;
     const [fw, fh] = geometry.frame, [cw, ch] = geometry.content, [ox, oy] = geometry.offset;
     const minX = Math.min(0, ox), minY = Math.min(0, oy);
     const maxX = Math.max(fw, ox + cw), maxY = Math.max(fh, oy + ch);
-    const k = Math.min(W / (maxX - minX), H / (maxY - minY));
+    const k = Math.min((W - 2 * margin) / (maxX - minX), (H - 2 * margin) / (maxY - minY));
     const tx = (W - (maxX - minX) * k) / 2 - minX * k;
     const ty = (H - (maxY - minY) * k) / 2 - minY * k;
-    const add = (cls, x, y, w, h) => {
-      const d = document.createElement("div");
-      d.className = cls;
-      d.style.left = `${tx + x * k}px`;
-      d.style.top = `${ty + y * k}px`;
-      d.style.width = `${Math.max(1, w * k)}px`;
-      d.style.height = `${Math.max(1, h * k)}px`;
-      box.append(d);
+    const place = (node, x, y, w, h) => {
+      node.style.left = `${tx + x * k}px`;
+      node.style.top = `${ty + y * k}px`;
+      node.style.width = `${Math.max(1, w * k)}px`;
+      node.style.height = `${Math.max(1, h * k)}px`;
+      box.append(node);
+      return node;
     };
-    if (fit === "pad") add(`frame-bg pad-${padColor}`, 0, 0, fw, fh);
-    add("picture", ox, oy, cw, ch);
-    if (fit === "crop") {
-      add("outside", minX, minY, maxX - minX, -minY);               // above the frame
-      add("outside", minX, fh, maxX - minX, maxY - fh);             // below
-      add("outside", minX, 0, -minX, fh);                           // left
-      add("outside", fw, 0, maxX - fw, fh);                         // right
+    if (fit === "pad") place(make("div", `pad-${padColor}`), 0, 0, fw, fh);
+    let pic;
+    if (imageUrl) {
+      // Reuse the element for the same image so redraws never flash or refetch.
+      if (!box._img || box._img.dataset.src !== imageUrl) {
+        box._img = make("img", "pic");
+        box._img.alt = "";
+        box._img.dataset.src = imageUrl;
+        box._img.src = imageUrl;
+      }
+      pic = box._img;
+    } else {
+      pic = make("div", "pic");
     }
-    add("frame", 0, 0, fw, fh);
+    place(pic, ox, oy, cw, ch);
+    if (fit === "crop") {
+      place(make("div", "outside"), minX, minY, maxX - minX, -minY);   // above the frame
+      place(make("div", "outside"), minX, fh, maxX - minX, maxY - fh); // below
+      place(make("div", "outside"), minX, 0, -minX, fh);               // left
+      place(make("div", "outside"), fw, 0, maxX - fw, fh);             // right
+    }
+    place(make("div", "frame"), 0, 0, fw, fh);
   }
 
   function renderPreview() {
     const item = referenceItem();
     const row = item && state.rows.get(item.id);
-    if (!item || !row || !row.output) {
-      el.preview.hidden = true;
+    if (!item) {
+      drawFrame(el.previewFrame, null);
+      el.previewTitle.textContent = "No image selected";
+      el.previewDims.textContent = "";
+      el.previewNote.textContent = "";
       return;
     }
-    el.preview.hidden = false;
-    const fit = row.kind === "pad" || row.kind === "crop" ? row.kind : "";
-    drawDiagram(el.previewDiagram, row.geometry, fit, el.padColor.value);
     el.previewTitle.textContent = item.name;
-    const ratio = row.kind === "scale" || row.kind === "exact"
-      ? ` — still ${item.ratio}` : "";
-    el.previewDims.textContent =
-      `${dims([item.width, item.height])} (${item.ratio} ${item.orientation}) → ${dims(row.output)}${ratio}`;
+    el.previewTitle.title = item.path;
+    if (!row || !row.output) {
+      drawFrame(el.previewFrame, { frame: [item.width, item.height], content: [item.width, item.height], offset: [0, 0] },
+        "", "", previewUrl(item.id));
+      el.previewDims.textContent = `${dims([item.width, item.height])} (${item.ratio} ${item.orientation})`;
+      el.previewNote.textContent = row ? row.note : "";
+      return;
+    }
+    const fit = row.kind === "pad" || row.kind === "crop" ? row.kind : "";
+    drawFrame(el.previewFrame, row.geometry, fit, el.padColor.value, previewUrl(item.id));
+    const same = row.kind === "scale" || row.kind === "exact" ? ` · still ${item.ratio}` : "";
+    el.previewDims.textContent = `${dims([item.width, item.height])} → ${dims(row.output)}${same}`;
     el.previewNote.textContent = row.warning ? `${row.note}. ${row.warning}.` : row.note;
   }
 
@@ -358,8 +398,8 @@
       || state.queue.find((i) => state.rows.get(i.id)?.alternatives);
     const alts = ref && state.rows.get(ref.id).alternatives;
     if (!alts) return;
-    drawDiagram(el.diagramPad, alts.pad.geometry, "pad", el.padColor.value);
-    drawDiagram(el.diagramCrop, alts.crop.geometry, "crop", el.padColor.value);
+    drawFrame(el.diagramPad, alts.pad.geometry, "pad", el.padColor.value, thumbUrl(ref.id));
+    drawFrame(el.diagramCrop, alts.crop.geometry, "crop", el.padColor.value, thumbUrl(ref.id));
     el.detailPad.textContent = `${ref.name}: ${alts.pad.note}`;
     el.detailCrop.textContent = `${ref.name}: ${alts.crop.note}`;
   }
@@ -457,8 +497,11 @@
 
   async function removeSelected() {
     if (!state.selected.size) return;
-    try { setQueue((await api("queue/remove/", { ids: [...state.selected] })).queue); }
-    catch (err) { reportError(err); }
+    try {
+      const ids = [...state.selected];
+      state.selected.clear();
+      setQueue((await api("queue/remove/", { ids })).queue);
+    } catch (err) { reportError(err); }
   }
 
   async function clearQueue() {
@@ -514,14 +557,14 @@
     state.anchor = order[next];
     renderQueue();
     renderConflict();
-    el.queueBody.children[next]?.scrollIntoView({ block: "nearest" });
+    state.rowEls.get(order[next])?.scrollIntoView({ block: "nearest" });
   }
 
   // -- batch --------------------------------------------------------------------------
   function setProgress(done, total) {
     const pct = total ? Math.round((done / total) * 100) : 0;
     el.progressChunk.style.width = `${pct}%`;
-    el.progressText.textContent = `${pct}%`;
+    el.progressText.textContent = total ? `${done} / ${total} · ${pct}%` : "";
     el.progress.setAttribute("aria-valuenow", String(pct));
   }
 
@@ -582,7 +625,7 @@
       }
       case "starting":
       case "loading": return "Loading model…";
-      case "processing": return `Processing ${job.current}…  (${job.done}/${job.total} done)`;
+      case "processing": return `Processing ${job.current}…`;
       default: return `${job.done}/${job.total} done`;
     }
   }
@@ -591,7 +634,7 @@
     for (const line of job.log) log(line);
     state.logNext = job.log_next;
     setProgress(job.done, job.total);
-    // Rebuild the table only when a result changed, not on every poll.
+    // Rebuild rows only when a result changed, not on every poll.
     const resultsKey = JSON.stringify(job.results);
     if (resultsKey !== state.resultsKey) {
       state.resultsKey = resultsKey;
@@ -622,12 +665,14 @@
     const cancelled = job.state === "cancelled";
     el.status.textContent = `${cancelled ? "Cancelled" : "Finished"} — ${job.ok} ok, ${job.failed} failed`;
     if (job.state === "failed") {
-      showMessage("warning", "Couldn't start", "The model could not be prepared. See the log for details.");
+      showMessage("warning", "Couldn't start", "The model could not be prepared. See the activity log for details.");
+      $("log-panel").open = true;
     } else if (job.failed === 0) {
       showMessage("info", cancelled ? "Cancelled" : "Done",
         cancelled ? `Upscaled ${job.ok} image(s) before cancelling.` : `Upscaled ${job.ok} image(s).`);
     } else {
-      showMessage("warning", "Finished with errors", `${job.ok} succeeded, ${job.failed} failed. See log.`);
+      $("log-panel").open = true;
+      showMessage("warning", "Finished with errors", `${job.ok} succeeded, ${job.failed} failed. See the activity log.`);
     }
   }
 
@@ -642,11 +687,10 @@
     el.cancel.addEventListener("click", cancel);
     el.match.addEventListener("click", matchSelectedShape);
 
-    // Select on press, like a native list (and robust to the table being redrawn
-    // between press and release while a batch updates it).
-    el.queueBody.addEventListener("mousedown", (e) => {
-      const tr = e.button === 0 && e.target.closest("tr[data-id]");
-      if (tr) selectRow(tr.dataset.id, e);
+    // Select on press, like a native list (and robust to rows updating mid-click).
+    el.rows.addEventListener("mousedown", (e) => {
+      const row = e.button === 0 && e.target.closest(".queue-row");
+      if (row) selectRow(row.dataset.id, e);
     });
     el.queueList.addEventListener("keydown", (e) => {
       if (e.key === "Delete" && !state.running) { e.preventDefault(); removeSelected(); }
@@ -683,6 +727,9 @@
     for (const input of [el.outputDir, el.suffix, el.tile, el.quality, el.device, el.fp16]) {
       input.addEventListener("input", schedulePlan);
     }
+
+    // Keep the result frame sized to its box as the window changes.
+    if (window.ResizeObserver) new ResizeObserver(() => renderPreview()).observe(el.previewFrame);
 
     // Explorer drops are handled natively by the desktop app (which knows the
     // real paths); a plain browser only gets file contents, so explain instead.

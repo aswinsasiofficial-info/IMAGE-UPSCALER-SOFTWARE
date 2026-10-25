@@ -33,9 +33,10 @@ Ollama keeps even those on your computer); the two features are independent
   factor (default **4×**; 1–8× allowed), so nothing is ever cropped, stretched,
   zoomed or distorted by default. A 1024 × 1536 portrait at 4× becomes exactly
   4096 × 6144; a 1536 × 1024 landscape becomes 6144 × 4096.
-- **Output sizes shown before processing** — every queued image lists its
-  original size and shape and the exact pixel size it will be saved at, with a
-  small diagram of the result for the selected image.
+- **Previews and output sizes before processing** — every queued image shows
+  its thumbnail, original size and shape, and the exact pixel size it will be
+  saved at; the selected image is shown large, inside its output frame (with
+  the borders or trimmed edges an exact size would cause).
 - **Optional exact size, never silent** — if you type a fixed W × H and an
   image has a different shape, the app says so (how many images, by how much)
   and refuses to start until you explicitly pick **Pad to fit** (whole picture
@@ -81,15 +82,25 @@ Ollama keeps even those on your computer); the two features are independent
   (`keyring`) or via the `GEMINI_API_KEY` / `GROQ_API_KEY` / `OLLAMA_API_KEY`
   environment variables. Local Ollama is refused a key by design. Keys are
   never written to exports.
-- **Visual grid preview** of every selected image with per-image status
-  (pending / generating / done / failed) and error tooltips.
-- **Everything editable** — change title/description/keywords before export;
-  failed or selected items can be **retried / regenerated** individually.
-- **Final review step** — a review table with validation warnings before any
-  file is written.
-- **Exports** — contributor-friendly **CSV** (`Filename, Title, Description,
-  Keywords`) and/or **embedding into the images themselves** (PNG tEXt chunks
-  / JPEG comment — as copies or in place) as an explicit opt-in.
+- **Image list with thumbnails** — every selected image is a tile with its
+  thumbnail, filename, status (not generated / generating / done / failed),
+  keyword count and title, or its error. Filters (All / Pending / Done / Failed)
+  and counts keep big batches manageable; thumbnails load in the background,
+  only for tiles on screen, so hundreds of images stay fast.
+- **Large preview + editor** — the selected image is shown large next to its
+  editable title, description and keywords, with character/keyword counters
+  against Adobe's limits. Edits are kept per image.
+- **Export** — saves the current metadata (edits included) as a contributor
+  **CSV** (`Filename, Title, Description, Keywords`). The first Export asks
+  where to save; later Exports update that file (*Export As…* picks another).
+  The same menu offers **Embed Metadata into Images…** (PNG tEXt chunks / JPEG
+  comment — as copies or in place).
+- **Folder batches look after themselves** — temporary failures are retried
+  automatically for the failed images only (finished ones are never
+  regenerated), and the complete CSV is saved into the folder once *every*
+  image has metadata — never a partial one after a failure or a cancel.
+- **Fits the window** — three columns when wide, the editor and provider
+  settings as tabs when narrower; light and dark mode follow Windows.
 
 ## Requirements
 
@@ -159,12 +170,27 @@ Then:
 On the very first run the app downloads `RealESRGAN_x4plus.pth` into `models/`
 and shows download progress in the status bar.
 
+### Run the Upscaler in a web browser (optional)
+
+The Upscaler screen is a Django web page, so it also runs on its own:
+
+```powershell
+.\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000
+```
+
+Then open <http://127.0.0.1:8000/> and stop the server with `Ctrl+C`. It only
+listens on this computer. Without the desktop app there are no native file
+dialogs: **Add Images… / Add Folder…** ask you to paste file or folder paths
+(one per line), and drag & drop isn't available. Everything else — previews,
+output sizes, pad/crop, upscaling — works the same. The Metadata screen is
+part of the desktop app only.
+
 ### Metadata Generator — step by step
 
 1. Upscale your images first and note where they were saved.
 2. Click **Metadata** in the top navigation.
 3. **Add Images… / Add Folder…** (or drag & drop) to pick the saved images —
-   each appears as a preview tile.
+   each appears in the list with its thumbnail; click one to see it large.
 4. Choose the **provider**:
    - **Gemini / Groq / Ollama Cloud** — enter the **API key** (tick *Remember*
      to store it in the Windows Credential Manager). Each provider keeps its own
@@ -173,19 +199,19 @@ and shows download progress in the status bar.
      `http://localhost:11434`, start Ollama, then press **Check Connection &
      Vision Models**: the model box is refilled with only the installed models
      that can read images, and the notice tells you what happens to your files.
-5. **Generate Metadata** — watch per-image status; use **Retry Failed** or
-   select tiles + **Regenerate Selected** when needed. Temporary problems
-   (rate limits, timeouts, provider 5xx) are retried automatically with growing
-   waits and only for the images that failed; permanent problems (missing model,
-   dead local server, bad key, unsupported image) stop immediately with an
-   explanation. Edit any title / description / keywords in the editor below the
-   grid — each tile keeps its own text.
-6. **Review & Export…** — check every row in the review table, then export a
-   contributor CSV and/or embed the metadata into the PNG/JPEG files (copies
-   or in place — your explicit choice).
-   When a **folder** was added, a complete `metadata.csv` is written into that
-   folder automatically as soon as *every* image in the batch succeeded — never
-   a partial one after a failure or a cancel.
+5. **Generate Metadata** — the progress bar, the status line and each tile
+   show what is happening. Temporary problems (rate limits, timeouts, provider
+   5xx) are retried automatically with growing waits and only for the images
+   that failed; permanent problems (missing model, dead local server, bad key,
+   unsupported image) stop immediately — select the image (or use the
+   **Failed** filter) to read why, fix it, then **Retry Failed**. Use
+   **Regenerate Selected** to redo chosen images. Edit any title / description
+   / keywords in the editor — each image keeps its own text.
+6. **Export** — saves the CSV with your edits. The first time it asks where;
+   after that it updates the same file (the label next to the button shows
+   which). When a **folder** was added, the complete `metadata.csv` is saved
+   into that folder automatically as soon as *every* image in the batch has
+   metadata — and Export then updates that file with any later edits.
 
 ## How it works
 
@@ -270,11 +296,33 @@ permanent-vs-temporary error classification including a truncated-JSON reply,
 batch retry passes that keep successful rows, and CSV export only after the
 whole folder batch succeeds.
 
+```powershell
+.\.venv\Scripts\python.exe -m tests.metadata_ui_test
+```
+
+The redesigned Metadata screen (offscreen): Export saves edits, asks for a
+location once and Export As… asks again; 25-image folder batches retry
+temporary failures for the failed images only and save the complete CSV only
+when every image succeeded (not after a permanent failure or a cancel);
+thumbnails load lazily (301 images add instantly, EXIF rotation applied) and
+the large preview appears; filters/counts; the three-column / tabs / stacked
+layouts.
+
+## Design
+
+Both screens share one design (`app/design.py`): the same colours for light
+and dark mode, type sizes and corner radii. `app/ui/theme.py` turns it into the
+Qt stylesheet for the desktop; the Upscaler template turns it into CSS custom
+properties, so the web page matches the desktop in the app *and* in a browser
+(where it follows the browser's light/dark preference). The desktop follows
+Windows' light/dark setting live; `UPSCALER_THEME=light` or `dark` forces one.
+
 ## Project layout
 
 ```
 app/
   main.py                     # GUI entry point (python -m app.main)
+  design.py                   # shared design tokens (desktop + web)
   upscaler/                   # the Upscaler — a Django app
     geometry.py               # output-size planning: scale / exact + pad/crop
     imaging.py                # EXIF-aware load, compose (resize/pad/crop), save
@@ -284,7 +332,8 @@ app/
     workspace.py              # queue + background batch (progress, log, cancel)
     forms.py                  # settings validation (pad/crop rule)
     views.py · urls.py        # page + JSON API
-    host.py                   # hooks the desktop lends it (dialogs, palette)
+    previews.py               # on-demand thumbnails / large previews (cached)
+    host.py                   # hooks the desktop lends it (dialogs, light/dark)
     templates/ · static/      # the page (HTML, CSS, JS)
   web/                        # Django project for the embedded server
     settings.py · urls.py
@@ -302,15 +351,17 @@ app/
     rrdbnet.py                # previous upscaler (not used by the app any more)
   ui/
     main_window.py            # shell: top navigation + stacked feature pages
+    theme.py                  # Qt palette + stylesheet from app/design.py
+    thumbnails.py             # background thumbnail/preview loading (Qt)
     upscaler_web_page.py      # Upscaler screen: embeds the Django page
     upscale_page.py           # previous upscaler screen (not used any more)
-    metadata_page.py          # Metadata Generator screen
-    metadata_review.py        # final review table + export options
+    metadata_page.py          # Metadata Generator screen (list, preview, editor, export)
 tests/
   upscaler_test.py            # Upscaler: planning, form, API, batches (no model)
   upscaler_model_test.py      # Upscaler with the real Real-ESRGAN network
   upscaler_desktop_test.py    # Upscaler inside the real window (offscreen)
   metadata_test.py            # metadata engine/worker/UI checks (no network)
+  metadata_ui_test.py         # Metadata screen: export, 25-image batches, thumbnails, layout
   ollama_test.py              # Ollama local + cloud provider/worker/UI checks
   smoke_test.py · target_size_test.py · worker_batch_test.py ·
   folder_mode_test.py · batch_rename_test.py   # previous upscaler

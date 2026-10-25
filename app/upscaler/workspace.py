@@ -340,6 +340,10 @@ class Workspace:
         with self._lock:
             return list(self.items)
 
+    def find(self, item_id: str) -> Optional[QueueItem]:
+        with self._lock:
+            return next((i for i in self.items if i.id == item_id), None)
+
     def root_for(self, item: QueueItem) -> Optional[Path]:
         with self._lock:
             match = find_root(item.path, self.roots)
