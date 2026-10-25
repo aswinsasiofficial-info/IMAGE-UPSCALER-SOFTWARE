@@ -1,23 +1,25 @@
 # Batch Image Upscaler + Metadata Generator — Comprehensive Project Documentation
 
-**Version:** 2.0 · **Model:** Real-ESRGAN `x4plus` · **Stack:** Python 3.10+, PyTorch (CUDA 12.6), PySide6 (Qt 6 + Qt WebEngine), Django
+**Version:** 3.0 · **Model:** Real-ESRGAN `x4plus` · **Stack:** Python 3.10+, PyTorch (CUDA 12.6), PySide6 (Qt 6), Django forms (standalone) · packaged with PyInstaller
 
-A fully local, GPU-accelerated Windows desktop application that batch-upscales images
-(**4× by default**) using the **Real-ESRGAN x4plus** super-resolution model. It is tuned to
-run on an **NVIDIA RTX 3050 (6 GB VRAM)** with 16 GB system RAM, processes 20–30+ images per
-batch, and requires **no internet connection after the one-time model-weight download**.
-Every output keeps **its own aspect ratio and its whole picture**: width and height are
-multiplied by the same factor, and nothing is cropped, stretched or zoomed unless the user
-explicitly asks for an exact size *and* picks padding or cropping for it.
+A fully local, GPU-accelerated **Windows desktop application** (no website, no web
+server) that batch-upscales images **1×–5× (4× by default)** using the
+**Real-ESRGAN x4plus** super-resolution model. It is tuned to run on an **NVIDIA RTX
+3050 (6 GB VRAM)** with 16 GB system RAM, processes 20–30+ images per batch, and
+requires **no internet connection after the one-time model-weight download** (the
+packaged build ships the weights). Every output keeps **its own aspect ratio and its
+whole picture**: width and height are multiplied by the same factor, and nothing is
+ever cropped, padded, stretched or zoomed.
 
-> **Version 2.0 rebuilt the Upscaler from scratch as a Django app** shown inside the
-> desktop window. The fixed 8000 × 5000 crop-to-fill output of 1.x is gone. The new
-> implementation is described in
-> [Section 16 — Upscaler 2.0 (Django)](#16-upscaler-20-django). Sections **3.2–3.5,
-> 5.3–5.4, 6.3, 8 and 11** below describe the *previous* upscaler modules
+> **Version 3.0 is desktop-only.** The Upscaler is a native Qt screen; the embedded
+> Django web page, its server and the browser fallback of 2.0 are gone, and Django is
+> kept only where it fits a desktop app — validating the Upscaler's settings. The
+> current Upscaler, the design system and packaging are described in
+> [Section 16 — Upscaler 3.0 (desktop)](#16-upscaler-30-desktop). Sections **1,
+> 3.2–3.5, 5.3–5.4, 6.3, 8, 10 and 11** below describe the *previous* upscaler modules
 > (`app/engine/realesrgan_upscaler.py`, `rrdbnet.py`, `worker.py`,
-> `app/ui/upscale_page.py`), which remain in the repository but are no longer used by
-> the app — except `worker.collect_images`, which the Metadata screen still imports.
+> `app/ui/upscale_page.py`) and their fixed 8000 × 5000 output, which remain in the
+> repository but are no longer used by the app.
 
 Since v1.4 the app also hosts a second, **completely independent** feature screen —
 the **Metadata Generator** (top navigation → *Metadata*) — which produces Adobe
@@ -27,9 +29,9 @@ cloud API). See [Section 14 — Metadata Generator](#14-metadata-generator).
 
 > **Note on resampling:** the neural network's internal upsampling uses
 > **nearest-neighbor** (feature-space) and the alpha-channel resize uses
-> **bicubic**. In 2.0 a **Lanczos** filter is used only when the requested size
-> differs from the network's exact 4× result — always with one factor for both
-> axes (see [Section 16.3](#163-size-planning)).
+> **bicubic**. A **Lanczos** filter is used only for factors other than the
+> network's native 4× — always with one factor for both axes (see
+> [Section 16.3](#163-upscale-factors-and-how-each-is-produced)).
 > See [Section 6 — Resampling Logic](#6-resampling-in-this-project) for the
 > network-side details.
 
@@ -52,7 +54,7 @@ cloud API). See [Section 14 — Metadata Generator](#14-metadata-generator).
 13. [Troubleshooting](#13-troubleshooting)
 14. [Metadata Generator](#14-metadata-generator)
 15. [License & Credits](#15-license--credits)
-16. [Upscaler 2.0 (Django)](#16-upscaler-20-django)
+16. [Upscaler 3.0 (desktop)](#16-upscaler-30-desktop)
 
 ---
 
@@ -104,35 +106,39 @@ the exact `target_width`×`target_height` (default 8000×5000) → centered crop
 ## 2. Project Layout
 
 ```
-d:\Upscaler\
+IMAGE-UPSCALER-SOFTWARE\
 ├── app/
-│   ├── main.py                      # GUI entry point (python -m app.main)
+│   ├── main.py                      # entry point (python -m app.main / BatchUpscaler.exe; --self-test)
+│   ├── selftest.py                  # headless check of a source or packaged build
+│   ├── paths.py                     # bundled assets + model folder (source vs packaged)
+│   ├── design.py                    # design tokens: colours (light/dark), Inter Tight, radii
+│   ├── imagefiles.py                # supported-image discovery shared by both screens
+│   ├── assets/                      # Inter Tight (OFL), Lucide icons (ISC), app icon
+│   ├── upscaler/                    # Upscaler 3.0 — see Section 16
+│   │   ├── geometry.py · imaging.py · files.py · workspace.py
+│   │   ├── engine.py · network.py   # Real-ESRGAN x4plus
+│   │   └── forms.py                 # settings validation (Django forms, standalone)
 │   ├── engine/
-│   │   ├── rrdbnet.py               # Real-ESRGAN x4plus network architecture
-│   │   ├── realesrgan_upscaler.py   # weights, tiled inference, image I/O
-│   │   ├── worker.py                # QThread batch runner (progress + cancel)
 │   │   ├── metadata_settings.py     # metadata dataclasses, Adobe limits, JSON parsing
 │   │   ├── metadata_providers.py    # Gemini/Groq/Ollama callers (retry, backoff)
-│   │   ├── metadata_worker.py       # QThread metadata batch + Ollama lookup
+│   │   ├── metadata_worker.py       # QThread metadata batch + automatic retry passes + Ollama lookup
 │   │   ├── metadata_export.py       # contributor CSV + PNG/JPEG in-file embedder
-│   │   └── credential_store.py      # API keys: session → env → Windows keyring
+│   │   ├── credential_store.py      # API keys: session → env → Windows keyring
+│   │   └── rrdbnet.py · realesrgan_upscaler.py · worker.py   # previous upscaler (unused)
 │   └── ui/
-│       ├── main_window.py           # shell: top navigation + stacked pages
-│       ├── upscale_page.py          # upscaler screen (behaviour unchanged)
-│       ├── metadata_page.py         # Metadata Generator screen
-│       └── metadata_review.py       # final review table + export options
+│       ├── main_window.py           # shell: top navigation + the two screens
+│       ├── upscaler_screen.py       # Upscaler screen (native Qt)
+│       ├── metadata_page.py         # Metadata screen (list, preview, editor, Export)
+│       ├── folder_picker.py         # choose up to 25 images of a large folder
+│       ├── widgets.py · icons.py    # shared cards/labels/preview · Lucide icon buttons
+│       ├── theme.py · thumbnails.py # Qt stylesheet from the tokens · background thumbnails
+│       └── upscale_page.py          # previous upscaler screen (unused)
 ├── models/
 │   └── RealESRGAN_x4plus.pth        # pretrained weights (~67 MB, auto-downloaded)
-├── tests/
-│   ├── smoke_test.py                # headless end-to-end engine check
-│   ├── worker_batch_test.py         # BatchWorker path test (offscreen Qt)
-│   ├── target_size_test.py          # exact-target crop-to-fill + transparency test
-│   ├── folder_mode_test.py          # folder-mode scan/output-path test (no model)
-│   ├── metadata_test.py             # metadata engine/worker/UI test (no network)
-│   └── ollama_test.py               # Ollama local+cloud provider/worker/UI test
-├── setup.ps1                        # one-time environment installer
-├── run.bat                          # double-click launcher
-├── run.ps1                          # PowerShell launcher
+├── packaging/                       # PyInstaller spec, launcher, icon generator
+├── tests/                           # see Sections 14.5 and 16.8
+├── setup.ps1 · run.bat · run.ps1    # one-time installer · launchers (from source)
+├── build.ps1                        # builds dist\BatchUpscaler\BatchUpscaler.exe + self-test
 ├── requirements.txt                 # pinned deps incl. CUDA index URL
 └── README.md                        # quick-start guide
 ```
@@ -147,11 +153,13 @@ d:\Upscaler\
 `QApplication`**. On some Windows CUDA setups, importing torch after Qt triggers a
 DLL-initialisation race; importing torch first avoids it. If the torch import fails,
 the app prints remediation instructions and exits with code `2` instead of crashing
-inside the GUI. Otherwise it constructs a `QApplication` (style: `Fusion`), shows
-`MainWindow`, and enters the Qt event loop.
+inside the GUI. Otherwise it constructs a `QApplication`, applies the theme (Fusion +
+the stylesheet built from `app/design.py`, Inter Tight registered from
+`app/assets/fonts`), shows `MainWindow`, and enters the Qt event loop.
+`--self-test REPORT.json` runs `app/selftest.py` instead (Section 16.7).
 
 Run via: `python -m app.main` (module form is required so the `app.*` package
-imports resolve).
+imports resolve), or `BatchUpscaler.exe` in the packaged build.
 
 ### 3.2 `app/engine/rrdbnet.py` — Network Architecture
 
@@ -760,6 +768,9 @@ upscaler never triggers metadata, and the metadata screen never loads torch.
 ```
 MetadataPage (app/ui/metadata_page.py)
   add images/folder → thumbnail grid (status-coloured tiles, per-image tooltip)
+    a folder batch holds ≤ 25 images: a folder with more opens FolderPickDialog
+    (app/ui/folder_picker.py) — every image as a thumbnail, the first 25 ticked,
+    "N of 25 selected", Add refused above the limit
   → (Ollama only) Check Connection & Vision Models →
       OllamaLookupWorker (QThread) → GET /api/tags (+ /api/show per model)
       → only models whose capabilities include "vision" fill the model box
@@ -768,33 +779,41 @@ MetadataPage (app/ui/metadata_page.py)
       build_prompt()            JSON contract + language + keyword budget
       _call_gemini() | _call_groq() | _call_ollama()   provider dispatch, retry/backoff
       parse_model_json() + sanitize_metadata()   Adobe limits enforced
-  → item_done/item_failed → grid colour + editor panel (all fields editable)
+    then up to 2 automatic retry passes over ONLY the images that failed
+    temporarily (5 s, then 10 s wait); permanent failures are final at once
+  → item_done/item_failed → list tile status + editor panel (all fields editable)
   → folder batch where EVERY image succeeded → write_csv() auto-exports
     metadata.csv into the selected folder (metadata_2.csv, … if one already
-    exists; never overwritten). Any failure or cancellation → no auto-export;
-    successful/failed rows stay in the list for Retry Failed
-  → ReviewDialog (app/ui/metadata_review.py)  read-only table + warnings
-  → exports:
-      write_csv()      Filename, Title, Description, Keywords (UTF-8 BOM)
-      embed_metadata() PNG tEXt chunks / JPEG COM comment — copies or in place
+    exists — files the app didn't write are never overwritten). Any failure or
+    cancellation → no auto-export; successful/failed rows stay in the list for
+    Retry Failed. The written file becomes Export's save location
+  → Export: write_csv() of every finished row, edits included, in Adobe Stock's
+    template columns Filename,Title,Keywords,Category,Releases (keywords in one
+    quoted cell, ≤ 49, most important first; Category = number 1–21; Releases
+    blank unless typed; UTF-8 BOM) — asks for a location the first time,
+    then updates that file; Export As… picks another
+  → Export ▾ Embed Metadata into Images…: embed_metadata() PNG tEXt chunks /
+    JPEG COM comment — copies or in place, the user's explicit choice
 ```
 
 ### 14.2 Modules
 
 | Module | Responsibility |
 |---|---|
-| `app/engine/metadata_settings.py` | `MetadataSettings` / `ImageMetadata` dataclasses; Adobe constants (title ≤ 70, **≤ 50 keywords**); the provider registry (`SUPPORTED_PROVIDERS` = Gemini, Groq, `Ollama (Local)`, `Ollama Cloud`) with per-provider vision model catalogues, default models, server URLs (`OLLAMA_LOCAL_URL` / `OLLAMA_CLOUD_URL`) and env-var names; `provider_requires_key()` (local Ollama is keyless by design); prompt building (`build_prompt` asks Ollama for **exactly** `ADOBE_KEYWORDS_MAX` keywords, hosted providers keep the "up to N" wording); robust JSON extraction (`parse_model_json` sanitises fences/prose, dedups keywords); `prepare_analysis_bytes` |
+| `app/engine/metadata_settings.py` | `MetadataSettings` / `ImageMetadata` dataclasses; Adobe constants (title ≤ 70, **≤ 49 keywords**, the 21 `ADOBE_CATEGORIES`, `parse_category()`); the provider registry (`SUPPORTED_PROVIDERS` = Gemini, Groq, `Ollama (Local)`, `Ollama Cloud`) with per-provider vision model catalogues, default models, server URLs (`OLLAMA_LOCAL_URL` / `OLLAMA_CLOUD_URL`) and env-var names; `provider_requires_key()` (local Ollama is keyless by design); prompt building (`build_prompt` asks Ollama for **exactly** `ADOBE_KEYWORDS_MAX` keywords, hosted providers keep the "up to N" wording); robust JSON extraction (`parse_model_json` sanitises fences/prose, dedups keywords); `prepare_analysis_bytes` |
 | `app/engine/metadata_providers.py` | `generate_metadata()` dispatches Gemini (official `google-genai` SDK), Groq (OpenAI-compatible endpoint via `requests`) or Ollama — **both Ollama modes share `_call_ollama()`**, the official `POST /api/chat` with the image as base64 inside `messages[].images`, `stream: false`, `format: "json"` and `options` (temperature/num_predict). `ollama_base()` pins cloud to `https://ollama.com` (Bearer `OLLAMA_API_KEY`, upload) and honours a custom host for local mode (`http://localhost:11434`, no auth header, image never leaves the machine); local timeouts are 300 s so a CPU model can finish loading. `check_ollama()` performs the connection + availability check (`/api/tags`, plus `/api/show` capabilities on servers that do not report them) and returns only vision-capable models. Retries transient errors (408/409/425/429/5xx, timeouts, cloud network blips) up to 3 attempts with exponential backoff; permanent errors (bad key 401/402/403, missing/retired model 404, rejected image 400/413, **local server not running**, invalid settings) surface immediately. SDK exceptions are **never reconstructed** — they are wrapped in `ProviderError(message, code)`. A Gemini 404 retirement message is parsed for the suggested replacement model and surfaced in the error text; model combos are editable so the user can switch without a code change |
 | `app/engine/metadata_worker.py` | `MetadataWorker(QThread)`: loops the whole queue sequentially; emits `item_started(path, index, total)`/`item_done`/`item_failed` keyed by **full path** (same-named files in different folders stay distinct), plus `progress`/`finished_all`/`cancel` semantics identical to `BatchWorker`. A per-image failure never aborts the batch. Logs an explicit hosting notice per run (cloud = each image is uploaded to `https://ollama.com`; local = images stay on this computer). `OllamaLookupWorker(QThread)` runs the blocking connection/model check off the UI thread and reports back via `result(models, message)` |
 | `app/engine/metadata_export.py` | Contributor CSV (comma-joined keywords, `utf-8-sig` so Excel opens UTF-8) and in-file embedding: PNG `PngInfo` tEXt chunks, JPEG COM comment with a JSON payload (`quality="keep"` so pixels aren't re-degraded). Writes go to a temp file + `os.replace` so an in-place rewrite can never half-overwrite; non-PNG/JPEG raise a clear error |
 | `app/engine/credential_store.py` | API key resolution order: in-session (typed) → env var (`GEMINI_API_KEY` / `GROQ_API_KEY` / `OLLAMA_API_KEY`) → Windows Credential Manager via `keyring`, one entry **per provider** so credentials never leak across providers. Optional "Remember" persists to keyring; keys are never logged or exported. Keyless providers (local Ollama) short-circuit: `get_key()` returns `""` and `save_key()` refuses, so no credential is ever required or stored for a local server |
-| `app/ui/metadata_page.py` | The screen: grid preview + provider/model/key/language/keyword-count options, editor panel for the selected tile, per-image status, **Generate Metadata / Retry Failed / Regenerate Selected**, and **Review & Export…**. Switching provider swaps the model catalogue, hides the key field for local Ollama, shows the server-address field + **Check Connection & Vision Models** button for both Ollama modes, and prints a plain-language notice about where images go (hosted upload vs local only); the check runs on `OllamaLookupWorker` and refills the editable model box with the image-capable models actually available. Remembers folder selections (Add Folder… / dropped folders) and auto-exports the CSV into each touched folder root only when every image under that root has metadata (all-or-nothing, incl. across retry runs); file-only batches keep the manual flow until an export folder was chosen in Review & Export |
-| `app/ui/metadata_review.py` | Final review step: read-only table of every row, warnings (missing titles, non-embeddable formats), explicit export choices (CSV path; embed into copies vs in place) |
+| `app/ui/metadata_page.py` | The screen: image list (thumbnail, filename, status, keyword count, title or error per tile; All/Pending/Done/Failed filters with counts), large preview + editor for the selected image (counters against Adobe limits), Provider and Output cards, action bar with progress, **Generate Metadata / Retry Failed / Regenerate Selected / Cancel** and **Export ▾** (Export As…, Embed Metadata into Images…), an inline result banner and a collapsible activity log. Responsive: three columns ≥ 1180 px, list + tabs below that, stacked under 700 px. Thumbnails come from `app/ui/thumbnails.py` (background, on first paint, cached). Switching provider swaps the model catalogue, hides the key field for local Ollama, shows the server-address field + **Check Connection & Vision Models** button for both Ollama modes, and prints a plain-language notice about where images go (hosted upload vs local only); the check runs on `OllamaLookupWorker` and refills the editable model box with the image-capable models actually available. Remembers folder selections (Add Folder… / dropped folders) and auto-exports the CSV into each touched folder root only when every image under that root has metadata (all-or-nothing, incl. across retry runs); file-only batches are saved with Export |
 
 ### 14.3 UI behaviour
 
-- Grid tiles are colour-coded: grey = pending, yellow = generating, green =
-  done, red = failed (error text in the tooltip and the status line).
+- Each list tile shows the image's thumbnail, filename and a coloured status
+  (grey = not generated, blue = generating, green = done with keyword count,
+  red = failed) above its title — or, for a failure, the error. The selected
+  image appears large in the editor with its folder and status; filters narrow
+  the list to Pending / Done / Failed.
 - Every generated field is editable at any time; edits persist into the row
   model and are what gets exported (generation results never auto-overwrite
   manual edits mid-run for the item being edited). Selecting a different tile
@@ -803,7 +822,7 @@ MetadataPage (app/ui/metadata_page.py)
 - Provider panel is mode-aware: Gemini/Groq/Ollama Cloud show the key field,
   **Ollama (Local)** hides it entirely; both Ollama modes show the server
   address (local only — the cloud host is fixed) and a notice spelling out
-  where images go, with the keyword count preset to a full Adobe set of 50.
+  where images go, with the keyword count preset to a full Adobe set of 49.
 - **Check Connection & Vision Models** runs off the UI thread and only lists
   models whose reported capabilities include `vision`; text-only models are
   skipped and the log says how many, so a user can never pick a model that
@@ -814,19 +833,34 @@ MetadataPage (app/ui/metadata_page.py)
 - While a batch runs the status line shows `Processing image 3 of 10 — name`,
   the progress bar counts done/total, and all start buttons are disabled (a
   programmatic re-start is refused with a log line, never a second worker).
+- **Folder batches hold up to 25 images** (`FOLDER_BATCH_LIMIT`). A folder with
+  more opens the chooser (the log says how many it has); images already queued
+  from that folder count against the 25, a full folder batch shows an
+  explanation instead, and cancelling the chooser adds nothing.
+- **Automatic retries, failed images only.** Temporary failures (rate limits,
+  timeouts, provider 5xx, truncated JSON) are kept aside and re-run in up to two
+  more passes after a growing wait (5 s, 10 s), on top of the provider's own
+  per-request backoff; successful images are never requested again. Permanent
+  failures (bad key, missing model, rejected image, local server not running)
+  are reported immediately with the reason and never retried.
 - Failed rows are listed by name in the log at the end of the run; `Retry
   Failed` re-runs only those items.
+- Every action button is an icon (Lucide) with a tooltip naming the action and
+  its shortcut and an accessible name; Generate and Export keep a short label.
 - A **folder-based** batch auto-exports `metadata.csv` into the selected
   folder (`metadata_2.csv`, … if one exists — existing files are never
   overwritten) **only when every image in that folder batch has successfully
   generated metadata**. If any image fails or the batch is cancelled, no CSV
   is written; successful rows and failed-image statuses stay visible in the
   list so `Retry Failed` can re-run only the failures, and once all images
-  succeed the complete CSV is saved automatically. **File-only** batches keep
-  the manual Review & Export flow and auto-export only after an export folder
-  was chosen there once.
-- Embedding always remains behind the review dialog — in-file rewrites never
-  happen automatically.
+  succeed the complete CSV is saved automatically, and a banner says where.
+  **File-only** batches are saved with **Export**.
+- **Export** writes the current metadata, edits included, for every image that
+  has metadata (images without it are left out and counted in the banner). It
+  asks where to save the first time and then keeps updating that file — the
+  label next to the button shows which; *Export As…* chooses another.
+- Embedding is only ever done on request (Export ▾ → Embed Metadata into
+  Images…, copies or in place) — in-file rewrites never happen automatically.
 
 ### 14.4 Ollama modes — setup and limits
 
@@ -842,13 +876,13 @@ MetadataPage (app/ui/metadata_page.py)
 
 Request shape (both modes, `POST <base>/api/chat`): one user message with the
 prepared image as a base64 string in `images`, `stream: false`,
-`format: "json"`, `options.num_predict: 3072` (a 50-keyword Adobe set plus a
+`format: "json"`, `options.num_predict: 3072` (a 49-keyword Adobe set plus a
 description is a long answer — too small a budget cuts the JSON off mid-list)
 and **`think: false`**, because on a reasoning model the hidden chain of thought
 otherwise consumes the whole budget and `message.content` comes back empty
 (observed against a real local `qwen3.5` server). A server old enough to reject
 the unknown field is detected from its 400 and asked once more without it.
-Small local models also frequently answer with 40–45 of the 50 keywords asked
+Small local models also frequently answer with 40–45 of the 49 keywords asked
 for, so a shortfall of up to `_KEYWORD_TOP_UP_MAX` (12) triggers exactly one
 cheap follow-up that asks only for the missing ones; the merge is de-duplicated
 and a failing follow-up never discards the metadata that already arrived.
@@ -893,8 +927,8 @@ payload (base64 image in `messages[].images`, `stream: false`, `format: "json"`,
 variant (host pinned to `https://ollama.com`, Bearer key, custom local address
 ignored, `gemma4:31b` style IDs); credential isolation (`OLLAMA_API_KEY` named
 only for cloud, local mode runs keyless and refuses to store a key); the
-"exactly 50 keywords" prompt target with Adobe clamping, plus the keyword
-top-up (a 45/50 answer gets **exactly one** follow-up naming only the missing
+"exactly 49 keywords" prompt target with Adobe clamping, plus the keyword
+top-up (a 45/49 answer gets **exactly one** follow-up naming only the missing
 count and never repeating what is already collected, a refused follow-up keeps
 the 45 good keywords, a reply with 1 keyword is not topped up); the empty-answer
 error (non-retryable, one call) and the older-server fallback (400 naming
@@ -929,7 +963,12 @@ never require Ollama to be installed.
   This project reuses the public pretrained `x4plus` weights and re-implements the
   network architecture for local inference only.
 - **PyTorch** (BSD-style), **PySide6** (LGPLv3/commercial), **Pillow** (MIT-CMU),
-  **NumPy** (BSD) — review each upstream license for distribution/commercial use.
+  **NumPy** (BSD), **Django** (BSD), **PyInstaller** (GPL with a bootloader
+  exception that allows distributing the built app) — review each upstream
+  license for distribution/commercial use.
+- **Inter Tight** — The Inter Project Authors, SIL Open Font License 1.1
+  (`app/assets/fonts/OFL.txt`); **Lucide** icons — ISC License
+  (`app/assets/icons/LICENSE-lucide.txt`). Both license files ship with the app.
 - Output images are for personal use under the model's license terms; the BSD-3
   license requires retaining the original copyright notice in redistributions of
   the model/code.
@@ -939,140 +978,171 @@ never require Ollama to be installed.
 
 ---
 
-## 16. Upscaler 2.0 (Django)
+## 16. Upscaler 3.0 (desktop)
 
-Version 2.0 replaces the upscaler with a new implementation written from scratch
-in Python and Django. It neither imports nor modifies the 1.x upscaler modules.
-Its one rule: **every image keeps its aspect ratio and its whole picture**, unless
-the user explicitly chooses otherwise for an exact output size.
+Version 3.0 makes the whole application a desktop program: no website, no web
+server, no browser view. The Upscaler written from scratch in 2.0 keeps its
+engine, but its screen is now native Qt, and its options are simpler. It
+neither imports nor modifies the 1.x upscaler modules. Its one rule: **every
+image keeps its aspect ratio and its whole picture** — there is no option that
+crops, pads or stretches.
 
 ### 16.1 How it fits into the desktop app
 
 ```
-MainWindow (PySide6, top navigation)
- ├─ Upscaler ─ UpscalerWebPage            app/ui/upscaler_web_page.py
- │     QWebEngineView ⇄ http://127.0.0.1:<free port>/      (launch cookie + CSRF)
- │     lends the page: native file/folder dialogs, message boxes,
- │     Explorer drag & drop, the Qt palette/font (so both screens match)
- │            │
- │     Django project  app/web   settings · urls · middleware (launch token) · server
- │       └─ Django app app/upscaler
- │            views ─ forms ─ workspace (queue + batch thread) ─ engine / imaging / geometry
- └─ Metadata ─ MetadataPage (native Qt, unchanged, no link to the upscaler)
+MainWindow (PySide6, top navigation: Upscaler Ctrl+1 · Metadata Ctrl+2)
+ ├─ Upscaler ─ UpscalerScreen              app/ui/upscaler_screen.py
+ │     queue (thumbnail rows) · large preview · settings cards · action bar · log
+ │     settings dict ─► UpscaleForm (Django forms, standalone) ─► JobOptions
+ │     Workspace (queue + batch thread, polled every 250 ms by a QTimer)
+ │       └─ engine (Real-ESRGAN x4plus) · imaging · geometry · files
+ └─ Metadata ─ MetadataPage                app/ui/metadata_page.py
+       (independent: no code path to or from the Upscaler)
 ```
 
-- **Embedded server.** `app/web/server.py` starts Django's threaded WSGI server on
-  `127.0.0.1` with an OS-chosen port, in daemon threads of the app process, the
-  first time the Upscaler screen is shown. CSS/JS are served by Django's
-  `StaticFilesHandler`. Closing the window cancels a running batch (3 s grace)
-  and stops the server.
-- **No database.** The queue and the batch live in memory (`Workspace`), like the
-  rest of the desktop UI.
-- **Security.** The API takes file paths and writes files, so: a fresh
-  `SECRET_KEY` and launch token every launch; the shell opens `/?launch=<token>`,
-  which is exchanged for an `HttpOnly`, `SameSite=Strict` cookie required on every
-  request (`app/web/middleware.py`); Django CSRF protection on all POSTs;
-  `ALLOWED_HOSTS = 127.0.0.1, localhost` (blocks DNS rebinding); `X-Frame-Options: DENY`.
-- **Native pieces.** Views ask the desktop through `app/upscaler/host.py`. Requests
-  run on server threads, so `_GuiThreadBridge` hands each dialog to the GUI thread
-  with a blocking queued signal. Explorer drops are caught by the Qt widget, which
-  knows the real paths, and passed to the page with `runJavaScript`.
-- **Fallbacks.** Without Qt WebEngine the screen offers *Open Upscaler in Browser*
-  (same page; dialogs still open from the app). `python manage.py runserver`
-  serves the page standalone for development, with typed paths instead of dialogs.
-- **Startup.** `app/main.py` imports `QtWebEngineWidgets` before creating
-  `QApplication`, as Qt requires. The web view is created lazily, so building the
-  window headless (e.g. the Metadata tests) starts no browser and no server.
+- **Where Django fits.** Only as the validation layer: `app/upscaler/forms.py`
+  calls `settings.configure(USE_I18N=False, USE_TZ=True)` and `django.setup()`
+  itself — no project, no apps, no database, no URLs, no server. The screen
+  collects its widgets into a dict; `UpscaleForm` checks it and turns it into
+  `JobOptions`, and `first_error()` gives the message box text ("Upscale factor:
+  …"). Everything that was web-specific in 2.0 (`app/web`, views, URLs,
+  templates, static files, the launch-token middleware, `manage.py`, the
+  WebEngine host page) has been deleted, and a test asserts it stays deleted.
+- **Threading.** The batch runs on a plain thread inside `Workspace`; the screen
+  polls `Job.snapshot(since)` for progress, new log lines and per-image results,
+  so no Qt object is touched off the GUI thread. Closing the window cancels a
+  running batch (3 s grace).
+- **Separation.** Upscaling never starts metadata. Both screens share only
+  presentation code (`theme`, `icons`, `widgets`, `thumbnails`) and image
+  discovery (`app/imagefiles.py`).
 
 ### 16.2 Modules
 
 | Module | Responsibility |
 |---|---|
-| `app/upscaler/geometry.py` | Pure size planning: `SizeOptions` → `Plan(source, output, content, offset, fit, conflict)`, plus the human descriptions shown in the queue |
-| `app/upscaler/imaging.py` | EXIF-aware probe/load (16-bit → 8-bit, alpha split, RGB ICC profile kept), `compose()` (alpha merge, uniform Lanczos resize, pad or crop), atomic `save()`, `saved_size()` |
+| `app/upscaler/geometry.py` | Pure size planning: `FACTORS = (1, 2, 3, 4, 5)`, `MODEL_SCALE = 4`, `plan_size(w, h, factor)` → `Plan(source, output, factor)` with `megapixels` / `peak_megapixels`; `how_produced(factor)`, `describe(plan)`, `DETAIL_NOTE` — the texts the screen shows |
+| `app/upscaler/imaging.py` | EXIF-aware probe/load (16-bit → 8-bit, alpha split, RGB ICC profile kept), `compose()` (alpha merged with bicubic, then one Lanczos resize when the factor isn't 4×), atomic `save()`, `saved_size()` |
 | `app/upscaler/network.py` | RRDBNet x4plus (23 RRDB blocks, two nearest + conv 2× stages); layer names match the official checkpoint for `strict=True` loading |
-| `app/upscaler/engine.py` | Weight download/cache (`models/RealESRGAN_x4plus.pth`, shared with 1.x), device choice with CPU fallback, fp16, overlapping tiles into a uint8 canvas, cancel between tiles, CUDA out-of-memory → halve tile and retry |
-| `app/upscaler/files.py` | Recursive scan skipping `<folder>/upscaled/`, folder-mode output paths, `(1)` collision names, batch-rename numbering |
+| `app/upscaler/engine.py` | Weight download/cache (`paths.model_dir()`), device choice with CPU fallback, fp16, overlapping tiles into a uint8 canvas, cancel between tiles, CUDA out-of-memory → halve tile and retry |
+| `app/upscaler/files.py` | Folder-mode output paths (`<folder>/upscaled/…`), output names, `(1)` collision names, `SequentialNamer` for batch rename |
 | `app/upscaler/workspace.py` | Queue (`QueueItem`), `Job` thread (load model once, per-image pipeline, progress/log/results, cancel), `Workspace` singleton |
-| `app/upscaler/forms.py` | `UpscaleForm`: field validation plus the shape rule (pad/crop required on a conflict), JPEG transparency and 65,500 px limits; settings greyed out for the current choices aren't validated |
-| `app/upscaler/views.py`, `urls.py` | The page and its JSON API (16.5) |
-| `app/upscaler/templates/`, `static/` | The page: HTML, Fusion-style CSS (colours from the Qt palette, light and dark), vanilla JS client |
-| `app/web/*` | Django project: settings, root URLs, launch-token middleware, embedded server |
-| `app/ui/upscaler_web_page.py` | Qt host widget: lazy start, web view, GUI-thread bridge, drag & drop, palette export, shutdown |
+| `app/upscaler/forms.py` | `UpscaleForm`: allowed factors, output folder (not a file), JPEG quality when JPEG, the 65,500 px limit for every queued image at the chosen factor |
+| `app/imagefiles.py` | Supported extensions, recursive discovery skipping `<root>/upscaled`, the file-dialog filter — shared with the Metadata screen |
+| `app/paths.py` | Source vs packaged locations: bundled assets (`sys._MEIPASS`), the model folder (`UPSCALER_MODEL_DIR` → `models\` beside the app → `%LOCALAPPDATA%\BatchUpscaler\models`) |
+| `app/ui/upscaler_screen.py` | The screen (16.5) |
 
-### 16.3 Size planning
+### 16.3 Upscale factors and how each is produced
 
-**Scale (default 4×, 1–8×).** `output = (round(w·f), round(h·f))` with the *same* `f`,
-rounding half up. Nothing is cropped or padded.
+`output = (w × f, h × f)` with the **same whole-number** `f ∈ {1, 2, 3, 4, 5}` for
+both sides, so the shape can't change and no rounding is involved. 1× keeps the
+original size.
 
-**Exact W × H.** If one factor `s` rounds the image to exactly W × H on both axes
-(the same pixel rounding scale mode uses, so e.g. 1920 × 1080 → 5005 × 2815 counts),
-the image already has the frame's shape and is simply resized. Otherwise the shapes
-conflict, and the plan stays **unresolved**. The form refuses to start a
-batch, and `compose()` refuses to produce pixels, until the user picks:
+Real-ESRGAN x4plus has **one native scale, 4×**: the network ends in two fixed
+nearest-neighbour + convolution 2× stages (Section 6.1), and the public weights
+were trained for exactly that. The app never claims otherwise; the factor card
+shows the matching sentence from `how_produced()`:
 
-- **Pad** — resize by `fit` (the whole picture is kept) and centre it on a W × H
-  canvas, with white, black or transparent borders (transparent only for PNG);
-- **Crop** — resize by `fill = max(W/w, H/h)` and trim the overflow equally from both
-  sides.
+| Factor | How it's produced | Shown to the user |
+|---|---|---|
+| 4× | the network's output as is | "Native: Real-ESRGAN x4plus enlarges exactly 4× on both sides." |
+| 1× | 4×, then Lanczos reduce to the original size | "…a clean-up, not more pixels." |
+| 2×, 3× | 4×, then Lanczos reduce to 2× / 3× | "…then the result is reduced to N× with a high-quality Lanczos filter." |
+| 5× | 4×, then Lanczos enlarge by 1.25 | "…the remaining step to 5× is ordinary Lanczos interpolation — it adds pixels, not new detail." |
 
-There is no stretch mode. The preview the page shows is computed by this same
-module. Each batch re-plans every image from the pixels it actually loads, and
-every saved file is re-opened to confirm it has the planned size.
+Next to it, an info icon and a line of text say that **more pixels don't
+automatically mean more real detail** (`DETAIL_NOTE`).
 
-| Source | Setting | Output | What happens |
-|---|---|---|---|
-| 1024 × 1536 (2:3) | Scale 4× | **4096 × 6144** | same shape, whole picture |
-| 1536 × 1024 (3:2) | Scale 4× | **6144 × 4096** | same shape, whole picture |
-| 1024 × 1536 | Exact 2000 × 3000 | 2000 × 3000 | same shape — no choice needed |
-| 1024 × 1536 | Exact 8000 × 5000, no choice | — | blocked: "choose Pad or Crop" |
-| 1024 × 1536 | Exact 8000 × 5000, Pad | 8000 × 5000 | picture 3333 × 5000 + 2333/2334 px side borders |
-| 1024 × 1536 | Exact 8000 × 5000, Crop | 8000 × 5000 | filled 8000 × 12000, 3500 px trimmed top and bottom (58 % lost) |
-| 1536 × 1024 | Exact 8000 × 5000, Pad | 8000 × 5000 | picture 7500 × 5000 + 250 px side borders |
+| Source | Factor | Output |
+|---|---|---|
+| 1024 × 1536 (2:3) | 1× | 1024 × 1536 |
+| 1024 × 1536 (2:3) | 2× | 2048 × 3072 |
+| 1024 × 1536 (2:3) | 4× (default) | **4096 × 6144** |
+| 1536 × 1024 (3:2) | 4× | 6144 × 4096 |
+| 1024 × 1536 (2:3) | 5× | 5120 × 7680 |
+| 16000 × 9000 | 5× | refused — 80,000 px is over the 65,500 px limit |
+
+Every batch re-plans each image from the pixels it actually loads, checks that
+the network returned exactly 4×, and re-opens every saved file to confirm the
+planned size.
 
 ### 16.4 Per-image pipeline
 
 1. `imaging.load()` — EXIF orientation applied (a phone portrait stays portrait), alpha split off.
-2. `plan_size()` — from the loaded size; an unresolved conflict fails that image with a clear message.
+2. `plan_size()` — from the loaded size; over 65,500 px fails that image with a clear message.
 3. `RealESRGAN.upscale()` — exactly 4× on both axes (checked).
-4. `imaging.compose()` — alpha (bicubic) merged; one Lanczos resize to the plan's content size if it isn't 4×; pad or crop if the plan says so.
-5. `imaging.save()` — written to `name.ext.part` and renamed (no half-written files); JPEG flattens alpha onto white.
-6. `saved_size()` must equal the plan, and the log line records every step:
-   `[OK] portrait.png: 1024x1536 -> 4096x6144 (Scaled 4× on both sides — same 2:3 shape, whole picture kept) -> …\portrait_x4.png`
+4. `imaging.compose()` — alpha (bicubic, at 4×) merged; one Lanczos resize to the planned size unless the factor is 4×.
+5. `imaging.save()` — written to a temporary `.part` file and renamed (no half-written files); JPEG flattens alpha onto white.
+6. `saved_size()` must equal the plan, and the log line records each step:
+   `[OK] portrait.png: 1024x1536 -> AI 4096x6144 -> 2048x3072 (2× on both sides — same 2:3 shape, whole picture kept) -> …\KQATZ1.jpg`
 
-### 16.5 JSON API (all under the page origin)
+### 16.5 The Upscaler screen
 
-| Method & path | Purpose |
-|---|---|
-| `GET /` | The page (sets the CSRF cookie) |
-| `GET api/state/` | Queue + current batch |
-| `POST api/queue/add/` · `remove/` · `clear/` | Edit the queue (`paths` / `ids`) |
-| `POST api/plan/` | Validate settings; per image: output size, note, warnings, pad/crop alternatives |
-| `POST api/dialog/images/` · `folder/` · `output/` · `message/` | Native dialogs via the desktop host (501 without one) |
-| `POST api/jobs/` | Start a batch (400 with field errors, 409 if one is running) |
-| `GET api/jobs/current/?since=N` | Progress, phase, new log lines since N, per-image results |
-| `POST api/jobs/current/cancel/` | Cancel (between tiles / images) |
+- **Queue** — add images (`Ctrl+O`), add a folder (`Ctrl+Shift+O`), drag & drop,
+  remove (`Del`), clear. Each row: thumbnail (decoded in the background, EXIF
+  applied), name, original size and shape, **"→ output size"** at the current
+  factor, and either the status (done / failed / processing) or a warning —
+  *Too large* (over 65,500 px a side) or *Very large* (over 150 MP held in
+  memory). The selected image is shown large with its size and the plan.
+- **Upscale factor** — segmented 1× 2× 3× 4× 5× buttons (default 4×), the
+  how-it's-produced sentence, the detail note and a summary of the batch's output
+  sizes.
+- **Save to** — output folder (browse icon) or *Save beside each original*;
+  format **JPEG (default, quality 95)** or PNG; **Batch rename (default on)** —
+  one random 4–5 letter prefix per batch, numbered from 1 in each output folder,
+  taken numbers skipped; off keeps the original names with `(1)`, `(2)`… on a
+  clash. Existing files are never overwritten. The filename-suffix and
+  exact-size options of 2.0 are gone.
+- **Processing** — device (Auto / CUDA / CPU), tile size (from the VRAM probe),
+  fp16.
+- **Action bar** — status, "3 / 10 · 30%", progress bar, **Cancel** (`Esc`) and
+  **Upscale** (`Ctrl+Enter`); a banner and a message box report the result;
+  collapsible activity log.
 
-### 16.6 User-facing behaviour
+### 16.6 Design system
 
-Kept from 1.x: queue with Add Images / Add Folder / Remove Selected / Clear and
-drag & drop; output folder or *Save beside each original*; folder mode
-(`<folder>/upscaled/…`, structure preserved, `upscaled` skipped on rescans); Device /
-fp16 / tile size defaults from the CUDA probe; png/jpg + quality; filename suffix;
-batch rename; never overwriting; model loaded once per batch; Start / Cancel,
-progress bar, log, model-ready hint and completion dialogs.
+- **Tokens** in `app/design.py` — one palette for light and dark (follows
+  Windows; `UPSCALER_THEME=light|dark` forces one), radii, `FONT_FAMILY = "Inter
+  Tight"`. `app/ui/theme.py` builds the whole Qt stylesheet from them and
+  re-applies it when Windows switches mode.
+- **Inter Tight** (variable TTF, SIL OFL 1.1) is registered with
+  `QFontDatabase.addApplicationFont` at start-up and set as the application font,
+  so every widget, dialog and delegate uses it (Qt 6.7+ resolves the named
+  weights of the variable font).
+- **Icons** — Lucide SVGs in `app/assets/icons`, tinted to the theme by
+  `app/ui/icons.py` (normal + disabled states). `icon_button()` builds every
+  icon-only button with a tooltip ("what it does (shortcut)"), an accessible name
+  and description, and an optional shortcut; Generate, Export and Upscale keep a
+  short label next to the icon. Tests check that every icon-only button on both
+  screens has an icon, a tooltip and an accessible name.
+- **Shared widgets** — cards, labels, the preview, the banner, and the tile
+  painting used by both image lists and the folder chooser (`app/ui/widgets.py`).
 
-New: the **Output size** group (Scale by / Exact size); output size and an
-explanation for every queued image before processing; a shape diagram for the
-selected image; the conflict box with Pad and Crop diagrams and the exact pixels
-added or lost; *Match selected image's shape*; a suffix that follows the size
-(`_x4`, `_x2.5`, `_800x500`) until edited; cancel between tiles; automatic
-out-of-memory retry; RGB colour profiles kept.
+### 16.7 Packaging
 
-### 16.7 Testing
+`build.ps1` builds a one-folder app with PyInstaller (`packaging/BatchUpscaler.spec`):
+
+- `dist\BatchUpscaler\BatchUpscaler.exe` (windowed, app icon from
+  `app/assets/app.ico`) plus `_internal\` (Python, PyTorch with CUDA, Qt, the
+  assets) and `models\RealESRGAN_x4plus.pth` copied next to it — about 4.2 GB,
+  almost all of it CUDA PyTorch. Unused Qt modules (WebEngine, QML/Quick,
+  Multimedia, 3D, Charts, PDF) and torchvision are excluded.
+- After building, the script runs `BatchUpscaler.exe --self-test dist\self-test.json`
+  and fails if it doesn't pass. The self-test (`app/selftest.py`) checks the
+  bundled font and icons, builds the real window, validates its default settings
+  through `UpscaleForm` (4×, JPEG, batch rename), counts labelled icon buttons,
+  imports the Metadata provider libraries and checks the keyring backend, reports
+  PyTorch/CUDA, and runs the real model at every factor on a portrait and a
+  landscape image (exact sizes, JPEG, batch names).
+- The packaged app never writes into its own folder (it may sit in Program
+  Files): it reads the weights shipped in `models\`, and only if they are missing
+  downloads them to `%LOCALAPPDATA%\BatchUpscaler\models`.
+
+### 16.8 Testing
 
 | Command | Covers |
 |---|---|
-| `python -m tests.upscaler_test` | No model: planning for many shapes and factors; form rules; launch token, CSRF and host checks; batches writing real files for portrait 1024 × 1536, landscape 1536 × 1024 and an EXIF portrait (exact size, aspect ratio, and the output shrunk back must reproduce the source with each corner marker in its corner); 2.5×; exact size blocked → pad → crop; folder mode, alpha, ICC, no-overwrite, batch rename, cancel; no dependency on the 1.x upscaler |
-| `python -m tests.upscaler_model_test [--example]` | The real network on portrait, landscape, EXIF-rotated and transparent images at 4×, 2× and an exact size with pad/crop; outputs must line up with the source at zero offset (PSNR check) — `--example` adds 1024 × 1536 → 4096 × 6144 |
-| `python -m tests.upscaler_desktop_test` | The real window offscreen: lazy server, dialogs on the GUI thread, drag & drop, and clicking through the embedded page (conflict blocks Start until Pad is chosen) |
+| `python -m tests.upscaler_test` | No model: factors 1×–5× and the honest how-it's-produced texts; the Django settings form (defaults JPEG + rename, removed fields gone, too-large refused); batches writing real files for portrait 1024 × 1536 and landscape 1536 × 1024 at every factor (exact size, aspect ratio, and the output shrunk back must reproduce the source with each corner marker in its corner); 1024 × 1536 → 4096 × 6144; JPEG + rename defaults, no overwriting; folder mode, alpha, ICC; cancel; and that no web server, website file or link between the screens exists |
+| `python -m tests.upscaler_ui_test` | The real window offscreen: defaults, removed options absent, Inter Tight on the widgets, icons + tooltips + accessible names on every icon button of both screens, thumbnails and preview, the output size shown for 1×–5×, a 2× batch started from the Upscale button producing renamed JPEGs, the too-large message |
+| `python -m tests.upscaler_model_test [--example]` | The real network at every factor on portrait, landscape, EXIF-rotated and transparent images; outputs must line up with the source (PSNR check); a defaults run (JPEG, batch names) — `--example` adds 1024 × 1536 → 4096 × 6144 |
+| `python -m tests.metadata_ui_test` | Metadata screen: Export (edits included, asks once, Export As), the 25-image folder limit and chooser, automatic retries of failed images only, complete-only CSV, thumbnails, filters, layouts |
+| `BatchUpscaler.exe --self-test report.json` | The packaged build itself (16.7) |

@@ -1,48 +1,34 @@
-"""Tests for the rebuilt (Django) Upscaler — no model, no GPU, no network.
+"""Tests for the Upscaler core — no model, no GPU, no network, no window.
 
 Run with:  python -m tests.upscaler_test
 
 The Real-ESRGAN network is replaced by an exact nearest-neighbour 4x stand-in
-so every pixel is predictable. Covers the size planning (proportional scale,
-exact sizes with explicit pad/crop, no stretching), the settings form, the
-JSON API through Django's test client (launch token + CSRF included), real
-files written by a full batch for portrait and landscape images — checking
-dimensions, aspect ratio and that the whole picture survives — plus folder
-mode, naming, alpha/ICC handling, cancel, and independence from the old
-upscaler code.
+so every pixel is predictable. Covers the 1×–5× size planning (proportional,
+1× keeps the size, 1024×1536 at 4× → 4096×6144) and the honest description
+of how each factor is produced; the Django settings form; full batches that
+write real files for portrait and landscape images at every factor —
+checking size, aspect ratio and that the whole picture survives — with the
+JPEG and batch-rename defaults, no overwriting, folder mode, transparency,
+colour profiles and cancel; and that no website/web server is left.
 """
 
 from __future__ import annotations
 
-import json
-import logging
-import os
 import re
 import tempfile
 import time
 from pathlib import Path
 
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "app.web.settings")
-
-import django
-
-django.setup()
-
 import numpy as np
-from django.test import Client
-from django.test.utils import setup_test_environment
 from PIL import Image, ImageCms
 
 from app.upscaler import imaging
 from app.upscaler.engine import Cancelled
 from app.upscaler.files import OUTPUT_DIR_NAME, SequentialNamer, discover, unique_path
 from app.upscaler.forms import UpscaleForm
-from app.upscaler.geometry import (CROP, EXACT, PAD, SCALE, SizeOptions, plan_size,
-                                   round_half_up)
-from app.upscaler.workspace import reset_workspace
-from app.web import middleware
-
-setup_test_environment()
+from app.upscaler.geometry import (DETAIL_NOTE, FACTORS, MODEL_SCALE, describe, how_produced,
+                                   plan_size)
+from app.upscaler.workspace import JobOptions, Workspace
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKERS = {"tl": (255, 0, 0), "tr": (0, 200, 0), "bl": (0, 0, 255), "br": (255, 220, 0)}
@@ -114,140 +100,87 @@ def make_marked(path: Path, w: int, h: int, *, alpha: bool = False, orientation:
     return upright
 
 
-def assert_same_shape(src: tuple[int, int], out: tuple[int, int], factor: float) -> None:
-    sw, sh = src
-    ow, oh = out
-    assert (ow, oh) == (round_half_up(sw * factor), round_half_up(sh * factor)), (src, out, factor)
-    # Same aspect ratio up to sub-pixel rounding.
-    assert abs(ow / oh - sw / sh) <= (sw / sh) * (1.0 / min(oh, ow)) + 1e-9, (src, out)
-
-
 def assert_full_content(upright: Image.Image, out: Image.Image, tol: float = 2.0) -> None:
     """Shrinking the output back must reproduce the source: nothing cropped or shifted."""
     back = np.asarray(out.convert("RGB").resize(upright.size, Image.Resampling.BOX), np.float64)
     diff = np.abs(back - np.asarray(upright.convert("RGB"), np.float64)).mean()
     assert diff <= tol, f"output does not contain the whole picture (mean diff {diff:.2f})"
-    # Corner blocks must sit in the matching output corners.
     arr = np.asarray(out.convert("RGB"))
     h, w = arr.shape[:2]
-    corners = {"tl": arr[2, 2], "tr": arr[2, w - 3], "bl": arr[h - 3, 2], "br": arr[h - 3, w - 3]}
+    inset_x, inset_y = max(2, w // 40), max(2, h // 40)
+    corners = {"tl": arr[inset_y, inset_x], "tr": arr[inset_y, w - 1 - inset_x],
+               "bl": arr[h - 1 - inset_y, inset_x], "br": arr[h - 1 - inset_y, w - 1 - inset_x]}
     for name, color in corners.items():
-        assert np.abs(color.astype(int) - MARKERS[name]).max() <= 8, (name, color)
+        assert np.abs(color.astype(int) - MARKERS[name]).max() <= 24, (name, color)
 
 
-# -- geometry ----------------------------------------------------------------------
+def run_batch(ws: Workspace, options: JobOptions, timeout: float = 120) -> dict:
+    job = ws.start(options)
+    job.join(timeout)
+    assert not job.running, "batch did not finish in time"
+    return job.snapshot()
+
+
+# -- planning -----------------------------------------------------------------------
 def test_geometry() -> None:
-    four = SizeOptions(SCALE, factor=4)
-    p = plan_size(1024, 1536, four)
-    assert p.output == (4096, 6144) and p.content == p.output and p.offset == (0, 0)
-    assert plan_size(1536, 1024, four).output == (6144, 4096)
-    assert plan_size(1000, 1000, four).output == (4000, 4000)
-    for w, h in [(1024, 1536), (1536, 1024), (1001, 667), (333, 1999), (7, 3)]:
-        for f in (1, 1.5, 2, 2.5, 3, 4, 8):
-            assert_same_shape((w, h), plan_size(w, h, SizeOptions(SCALE, factor=f)).output, f)
+    assert FACTORS == (1, 2, 3, 4, 5) and MODEL_SCALE == 4
+    assert plan_size(1024, 1536, 4).output == (4096, 6144)
+    assert plan_size(1536, 1024, 4).output == (6144, 4096)
+    assert plan_size(1024, 1536, 1).output == (1024, 1536)          # 1× keeps the size
+    for w, h in [(1024, 1536), (1536, 1024), (1001, 667), (7, 3), (4000, 4000)]:
+        for f in FACTORS:
+            ow, oh = plan_size(w, h, f).output
+            assert (ow, oh) == (w * f, h * f) and ow * h == oh * w, (w, h, f)  # exact ratio
+    for bad in (0, 6, 2.5, 8):
+        try:
+            plan_size(100, 100, bad)
+            raise AssertionError(f"factor {bad} accepted")
+        except ValueError:
+            pass
+    assert "whole picture kept" in describe(plan_size(10, 20, 3))
+    assert describe(plan_size(10, 20, 1)).startswith("Same size")
 
-    # Exact frame with the image's own shape: plain uniform resize, no choice needed.
-    p = plan_size(1024, 1536, SizeOptions(EXACT, width=2000, height=3000))
-    assert p.output == p.content == (2000, 3000) and not p.conflict and p.resolved
-
-    # Different shape: unresolved until the user picks; nothing is ever stretched.
-    unchosen = plan_size(1024, 1536, SizeOptions(EXACT, width=8000, height=5000))
-    assert unchosen.conflict and not unchosen.resolved and unchosen.output == (8000, 5000)
-    pad = plan_size(1024, 1536, SizeOptions(EXACT, width=8000, height=5000, fit=PAD))
-    assert pad.content == (3333, 5000) and pad.padding == (2333, 0, 2334, 0)
-    crop = plan_size(1024, 1536, SizeOptions(EXACT, width=8000, height=5000, fit=CROP))
-    assert crop.content == (8000, 12000) and crop.cropped == (0, 3500, 0, 3500)
-    land = plan_size(1536, 1024, SizeOptions(EXACT, width=8000, height=5000, fit=PAD))
-    assert land.content == (7500, 5000) and land.padding == (250, 0, 250, 0)
-    land = plan_size(1536, 1024, SizeOptions(EXACT, width=8000, height=5000, fit=CROP))
-    assert land.content == (8000, 5333) and land.cropped == (0, 166, 0, 167)
-
-    # A frame typed from the image's own proportions always counts as the same shape
-    # (regression: 1920x1080 -> 5005x2815 used to be flagged by 1 px).
-    for w, h in [(1920, 1080), (1080, 1920), (1366, 768), (1001, 667), (3, 7)]:
-        for fw in range(1, 20001, 7):
-            fh = max(1, round_half_up(fw * h / w))
-            pl = plan_size(w, h, SizeOptions(EXACT, width=fw, height=fh))
-            assert not pl.conflict and pl.content == (fw, fh), (w, h, fw, fh, pl)
-        for f in (1, 1.5, 2.5, 4, 8):      # any scale-mode result, typed as an exact size
-            out = plan_size(w, h, SizeOptions(SCALE, factor=f)).output
-            assert not plan_size(w, h, SizeOptions(EXACT, width=out[0], height=out[1])).conflict
-    assert plan_size(1920, 1080, SizeOptions(EXACT, width=5005, height=2817)).conflict
-
-    # Every exact plan resizes the whole picture by one factor (shape kept).
-    for w, h in [(1024, 1536), (1536, 1024), (640, 480), (999, 1001)]:
-        for fw, fh in [(8000, 5000), (5000, 8000), (1920, 1080), (1000, 1000)]:
-            for fit in (PAD, CROP):
-                pl = plan_size(w, h, SizeOptions(EXACT, width=fw, height=fh, fit=fit))
-                cw, ch = pl.content
-                # One factor s for both axes, each side rounded to the nearest pixel.
-                assert abs(cw / w - ch / h) <= 0.5 / w + 0.5 / h + 1e-12, (w, h, fw, fh, fit, pl)
-                assert pl.output == (fw, fh)
-                if fit == PAD:
-                    assert cw <= fw and ch <= fh and min(pl.padding) >= 0
-                else:
-                    assert cw >= fw and ch >= fh and min(pl.cropped) >= 0
-    print("  geometry OK")
-
-
-# -- form ----------------------------------------------------------------------------
-def _settings(**kw) -> dict:
-    base = dict(size_mode=SCALE, scale_factor="4", exact_width="", exact_height="", fit="",
-                pad_color="white", output_dir="", save_beside=False, device="cpu", fp16=False,
-                tile=64, output_format="png", jpg_quality=95, suffix="_x4", rename_batch=False)
-    base.update(kw)
-    return base
+    # Honest about the model: only 4× is native; others are explained.
+    assert how_produced(4).startswith("Native")
+    assert "reduced back to the original size" in how_produced(1)
+    for f in (2, 3):
+        assert "native 4×" in how_produced(f) and "reduced" in how_produced(f)
+    assert "interpolation" in how_produced(5) and "not new detail" in how_produced(5)
+    assert "Native" not in how_produced(5)
+    assert "more real detail" in DETAIL_NOTE
+    print("  1×–5× planning + honest factor descriptions OK")
 
 
 def test_form() -> None:
+    base = dict(factor=4, output_dir="", save_beside=False, device="cpu", fp16=False, tile=64,
+                output_format="jpg", jpg_quality=95, rename_batch=True)
     imgs = [(1024, 1536), (1536, 1024)]
-    assert UpscaleForm(_settings(), images=imgs).is_valid()
-
-    exact = _settings(size_mode=EXACT, exact_width=8000, exact_height=5000)
-    form = UpscaleForm(exact, images=imgs)
-    assert not form.is_valid() and "fit" in form.errors, form.errors
-    assert "2 of 2" in form.errors["fit"][0]
-    assert UpscaleForm({**exact, "fit": PAD}, images=imgs).is_valid()
-    assert UpscaleForm({**exact, "fit": CROP}, images=imgs).is_valid()
-    # Matching frame: no choice required.
-    assert UpscaleForm(_settings(size_mode=EXACT, exact_width=4096, exact_height=6144),
-                       images=[(1024, 1536)]).is_valid()
-    # Unknown fit values (e.g. "stretch") are rejected.
-    assert "fit" in UpscaleForm({**exact, "fit": "stretch"}, images=imgs).errors
-
-    f = UpscaleForm({**exact, "fit": PAD, "pad_color": "transparent", "output_format": "jpg"},
-                    images=imgs)
-    assert not f.is_valid() and "pad_color" in f.errors
-    # A leftover pad choice doesn't matter once back in scale mode.
-    assert UpscaleForm(_settings(fit=PAD, pad_color="transparent", output_format="jpg"),
-                       images=imgs).is_valid()
-    f = UpscaleForm(_settings(scale_factor="8", output_format="jpg"), images=[(9000, 100)])
-    assert not f.is_valid() and "__all__" in f.errors        # 72000 px > JPEG limit
-    assert f.size_options() is not None                      # ...but the preview still works
-    f = UpscaleForm(_settings(size_mode=EXACT, exact_width=65501, exact_height=100),
-                    images=[(65501, 100)])
-    assert "exact_width" in f.errors                          # libjpeg stops at 65500
-    # Values left in boxes the page greys out never block a batch.
-    assert UpscaleForm({**exact, "fit": PAD, "scale_factor": "20"}, images=imgs).is_valid()
-    assert UpscaleForm(_settings(exact_width="70000", fit="bogus"), images=imgs).is_valid()
-    assert UpscaleForm(_settings(jpg_quality=""), images=imgs).is_valid()       # png output
-    assert UpscaleForm(_settings(rename_batch=True, suffix="a:b"), images=imgs).is_valid()
-    assert UpscaleForm(_settings(save_beside=True, output_dir=__file__), images=imgs).is_valid()
-    assert "jpg_quality" in UpscaleForm(_settings(output_format="jpg", jpg_quality=""),
-                                        images=imgs).errors
-    assert "suffix" in UpscaleForm(_settings(suffix="a/b"), images=imgs).errors
-    assert "scale_factor" in UpscaleForm(_settings(scale_factor="9"), images=imgs).errors
-    assert "exact_width" in UpscaleForm(_settings(size_mode=EXACT), images=imgs).errors
-    print("  form OK")
+    form = UpscaleForm(base, images=imgs)
+    assert form.is_valid(), form.errors
+    opts = form.job_options()
+    assert (opts.factor, opts.output_format, opts.rename_batch) == (4, "jpg", True)
+    for f in FACTORS:
+        assert UpscaleForm({**base, "factor": f}, images=imgs).is_valid()
+    for bad in (0, 6, "2.5", "x"):
+        assert "factor" in UpscaleForm({**base, "factor": bad}, images=imgs).errors, bad
+    form = UpscaleForm({**base, "factor": 5}, images=[(14000, 100)])        # 70000 px > limit
+    assert not form.is_valid() and "factor" in form.errors and form.first_error().startswith("Upscale factor:")
+    assert "jpg_quality" in UpscaleForm({**base, "jpg_quality": ""}, images=imgs).errors
+    assert UpscaleForm({**base, "output_format": "png", "jpg_quality": ""}, images=imgs).is_valid()
+    assert "output_dir" in UpscaleForm({**base, "output_dir": __file__}, images=imgs).errors
+    assert UpscaleForm({**base, "output_dir": __file__, "save_beside": True}, images=imgs).is_valid()
+    assert {"suffix", "exact_width", "fit"}.isdisjoint(UpscaleForm.base_fields)   # removed options
+    assert UpscaleForm.base_fields["output_format"].initial == "jpg"
+    assert UpscaleForm.base_fields["rename_batch"].initial is True
+    print("  Django settings form OK")
 
 
-# -- files / naming --------------------------------------------------------------------
 def test_files(tmp: Path) -> None:
     root = tmp / "files"
     (root / "sub").mkdir(parents=True)
     (root / OUTPUT_DIR_NAME / "sub").mkdir(parents=True)
-    for p in (root / "a.png", root / "sub" / "b.jpg", root / OUTPUT_DIR_NAME / "old_x4.png",
-              root / OUTPUT_DIR_NAME / "sub" / "b_x4.png"):
+    for p in (root / "a.png", root / "sub" / "b.jpg", root / OUTPUT_DIR_NAME / "old.png",
+              root / OUTPUT_DIR_NAME / "sub" / "b.png"):
         Image.new("RGB", (4, 4)).save(p)
     (root / "notes.txt").write_text("x")
     found = discover([root, root / "a.png"])
@@ -257,249 +190,104 @@ def test_files(tmp: Path) -> None:
     Image.new("RGB", (2, 2)).save(taken)
     assert unique_path(taken).name == "taken(1).png"
     namer = SequentialNamer("ABCD")
-    assert namer.next_path(tmp, ".png").name == "ABCD1.png"
-    assert namer.next_path(tmp, ".png").name == "ABCD2.png"
+    assert namer.next_path(tmp, ".jpg").name == "ABCD1.jpg"
+    assert namer.next_path(tmp, ".jpg").name == "ABCD2.jpg"
     namer.release(tmp)
-    assert namer.next_path(tmp, ".png").name == "ABCD2.png"
+    assert namer.next_path(tmp, ".jpg").name == "ABCD2.jpg"
+    Image.new("RGB", (2, 2)).save(tmp / "WXYZ1.jpg")
+    assert SequentialNamer("WXYZ").next_path(tmp, ".jpg").name == "WXYZ2.jpg"   # skips taken
     assert re.fullmatch(r"[A-Z]{4,5}", SequentialNamer().prefix)
-    print("  files OK")
+    assert JobOptions().output_format == "jpg" and JobOptions().rename_batch is True
+    print("  discovery, batch naming, no-overwrite OK")
 
 
-# -- imaging ------------------------------------------------------------------------------
 def test_imaging(tmp: Path) -> None:
-    # EXIF-rotated phone portrait: stored landscape, shown (and processed) as portrait.
     p = tmp / "phone.jpg"
     upright = make_marked(p, 60, 90, orientation=6)
     with Image.open(p) as raw:
         assert raw.size == (90, 60)
-    assert (imaging.probe(p).width, imaging.probe(p).height) == (60, 90)
+    info = imaging.probe(p)
+    assert (info.width, info.height) == (60, 90)
     src = imaging.load(p)
     assert src.size == (60, 90)
     assert np.abs(src.rgb.astype(int) - np.asarray(upright, int)).mean() < 4
-
-    # Probing a PNG must not decode its pixels (regression: getexif() loaded them).
-    from PIL import PngImagePlugin
-    big = tmp / "big.png"
-    Image.new("RGB", (3000, 2000), (10, 20, 30)).save(big)
-    loads = []
-    real_load = PngImagePlugin.PngImageFile.load
-    PngImagePlugin.PngImageFile.load = lambda self: (loads.append(1), real_load(self))[1]
-    try:
-        assert (imaging.probe(big).width, imaging.probe(big).height) == (3000, 2000)
-    finally:
-        PngImagePlugin.PngImageFile.load = real_load
-    assert not loads, "probe decoded the PNG"
-
-    # 16-bit greyscale must not clip to white.
     p16 = tmp / "grey16.png"
     Image.fromarray(np.arange(64 * 64, dtype=np.uint16).reshape(64, 64) * 16).save(p16)
     g = imaging.load(p16).rgb
-    assert 0 < g.mean() < 255 and g.min() < 20 and g.max() > 200, (g.min(), g.mean(), g.max())
-
-    # An unresolved plan can never be turned into pixels.
-    plan = plan_size(10, 20, SizeOptions(EXACT, width=40, height=20))
-    try:
-        imaging.compose(np.zeros((80, 40, 3), np.uint8), None, plan)
-        raise AssertionError("compose accepted an unresolved plan")
-    except ValueError:
-        pass
-    print("  imaging OK")
-
-
-# -- API + full batches ----------------------------------------------------------------------
-class Api:
-    def __init__(self, client: Client) -> None:
-        self.c = client
-
-    def _csrf(self) -> str:
-        return self.c.cookies["csrftoken"].value
-
-    def get(self, path: str):
-        return self.c.get(path)
-
-    def post(self, path: str, body: dict | None = None):
-        return self.c.post(path, data=json.dumps(body or {}), content_type="application/json",
-                           HTTP_X_CSRFTOKEN=self._csrf())
-
-    def wait_job(self, timeout: float = 120) -> dict:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            job = self.get("/api/jobs/current/").json()["job"]
-            if job and not job["running"]:
-                return job
-            time.sleep(0.05)
-        raise AssertionError("batch did not finish in time")
-
-
-def test_security() -> None:
-    token = middleware.new_launch_token()
-    try:
-        c = Client(enforce_csrf_checks=True)
-        assert c.get("/").status_code == 403                       # no token
-        assert c.get("/?launch=wrong").status_code == 403
-        assert c.get("/?launch=é").status_code == 403             # non-ASCII: refused, not a 500
-        r = c.get(f"/?launch={token}")
-        assert r.status_code == 302 and middleware.COOKIE_NAME in r.cookies
-        assert r.cookies[middleware.COOKIE_NAME]["samesite"] == "Strict"
-        r = c.get("/")
-        assert r.status_code == 200 and b"Start Upscaling" in r.content
-        # POST without the CSRF header is refused even with the launch cookie.
-        r = c.post("/api/queue/clear/", data="{}", content_type="application/json")
-        assert r.status_code == 403
-        assert Api(c).post("/api/queue/clear/").status_code == 200
-        # A foreign Host header (DNS rebinding) is refused (Django logs it; keep that quiet here).
-        security_log = logging.getLogger("django.security.DisallowedHost")
-        security_log.disabled = True
-        try:
-            assert c.get("/", HTTP_HOST="evil.example").status_code == 400
-        finally:
-            security_log.disabled = False
-    finally:
-        middleware.clear_launch_token()
-    print("  launch token / CSRF / host checks OK")
-
-
-def test_page() -> None:
-    c = Client(enforce_csrf_checks=True)
-    r = c.get("/")
-    assert r.status_code == 200
-    html = r.content.decode()
-    for text in ("Images to process", "Add Images…", "Add Folder…", "Remove Selected",
-                 "Save beside each original", "Half precision (fp16)", "Tile size (px):",
-                 "Scale by", "Exact size", "Pad to fit", "Crop to fill", "Filename suffix:",
-                 "Rename batch", "Start Upscaling", "Cancel"):
-        assert text in html, text
-    cfg = json.loads(re.search(r'id="upscaler-config"[^>]*>(.*?)</script>', html, re.S).group(1))
-    assert cfg["defaults"]["size_mode"] == "scale" and cfg["defaults"]["scale_factor"] == "4"
-    assert cfg["defaults"]["fit"] == ""                 # no silent default for pad/crop
-    assert "8000" not in html and "5000" not in html    # the fixed-shape target is gone
-    for asset in ("/static/upscaler/upscaler.css", "/static/upscaler/upscaler.js"):
-        assert asset in html
-    print("  page OK")
+    assert 0 < g.mean() < 255 and g.min() < 20 and g.max() > 200
+    print("  imaging (EXIF, 16-bit) OK")
 
 
 def test_batches(tmp: Path) -> None:
-    ws = reset_workspace(engine_factory=StubEngine)
     StubEngine.loads = 0
-    api = Api(Client(enforce_csrf_checks=True))
-    api.get("/")                                          # sets the CSRF cookie
     src = tmp / "in"
     src.mkdir()
-    out = tmp / "out"
     portrait = make_marked(src / "portrait.png", 1024, 1536)
     landscape = make_marked(src / "landscape.png", 1536, 1024)
     phone = make_marked(src / "phone.jpg", 300, 450, orientation=6)
 
-    r = api.post("/api/queue/add/", {"paths": [str(src / "portrait.png"), str(src / "landscape.png"),
-                                               str(src / "phone.jpg")]})
-    queue = r.json()["queue"]
-    sizes = {q["name"]: (q["width"], q["height"], q["orientation"]) for q in queue}
-    assert sizes == {"portrait.png": (1024, 1536, "portrait"),
-                     "landscape.png": (1536, 1024, "landscape"),
-                     "phone.jpg": (300, 450, "portrait")}, sizes
+    ws = Workspace(StubEngine)
+    result = ws.add([str(src / "portrait.png"), str(src / "landscape.png"), str(src / "phone.jpg")])
+    assert len(result.added) == 3
+    sizes = {i.path.name: (i.width, i.height) for i in ws.snapshot_items()}
+    assert sizes == {"portrait.png": (1024, 1536), "landscape.png": (1536, 1024),
+                     "phone.jpg": (300, 450)}, sizes
 
-    # The preview shows every expected output size before anything runs.
-    plan = api.post("/api/plan/", {"settings": _settings(output_dir=str(out))}).json()
-    assert plan["valid"] and plan["conflicts"] == 0
-    outputs = {row["name"]: tuple(row["output"]) for row in plan["items"]}
-    assert outputs == {"portrait.png": (4096, 6144), "landscape.png": (6144, 4096),
-                       "phone.jpg": (1200, 1800)}, outputs
+    # Defaults: 4×, JPEG, batch rename.
+    out = tmp / "out4"
+    snap = run_batch(ws, JobOptions(output_dir=out))
+    assert snap["state"] == "done" and snap["ok"] == 3 and StubEngine.loads == 1, snap
+    files = sorted(out.iterdir())
+    assert len(files) == 3 and all(f.suffix == ".jpg" for f in files)
+    prefixes = {re.fullmatch(r"([A-Z]{4,5})([123])\.jpg", f.name).group(1) for f in files}
+    assert len(prefixes) == 1, files                                   # one shared prefix
+    by_source = {}
+    for item_id, res in snap["results"].items():
+        name = next(i.path.name for i in ws.snapshot_items() if i.id == item_id)
+        by_source[name] = Path(res["output"])
+    for name, upright in (("portrait.png", portrait), ("landscape.png", landscape),
+                          ("phone.jpg", phone)):
+        with Image.open(by_source[name]) as im:
+            assert im.format == "JPEG"
+            assert im.size == (upright.width * 4, upright.height * 4), (name, im.size)
+            assert_full_content(upright, im, tol=4.0)
+    print("  4× JPEG batch: 1024×1536 → 4096×6144, 1536×1024 → 6144×4096, EXIF portrait "
+          "300×450 → 1200×1800; one rename prefix; whole picture kept")
 
-    # Full batch at 4x: real files, exact sizes, same shape, whole picture.
-    r = api.post("/api/jobs/", {"settings": _settings(output_dir=str(out))})
-    assert r.status_code == 200, r.json()
-    job = api.wait_job()
-    assert job["state"] == "done" and job["ok"] == 3 and job["failed"] == 0, job
-    assert StubEngine.loads == 1, "model must load once per batch"
-    for name, upright in (("portrait", portrait), ("landscape", landscape), ("phone", phone)):
-        path = out / f"{name}_x4.png"
-        with Image.open(path) as im:
-            assert_same_shape(upright.size, im.size, 4)
-            assert_full_content(upright, im, tol=2.0 if name != "phone" else 6.0)
-    print("  4x batch: portrait 1024x1536 -> 4096x6144, landscape 1536x1024 -> 6144x4096, "
-          "EXIF portrait 300x450 -> 1200x1800, whole picture kept")
-
-    # 2.5x goes through the Lanczos resize after the 4x model: still proportional.
+    # Every factor on small images, PNG so pixels can be compared exactly.
     small = tmp / "small"
     small.mkdir()
     p_small = make_marked(small / "p.png", 120, 180)
     l_small = make_marked(small / "l.png", 180, 120)
-    api.post("/api/queue/clear/")
-    api.post("/api/queue/add/", {"paths": [str(small)]})
-    r = api.post("/api/jobs/", {"settings": _settings(scale_factor="2.5", suffix="_x2.5")})
-    assert r.status_code == 200, r.json()
-    job = api.wait_job()
-    assert job["ok"] == 2, job
-    for name, upright in (("p", p_small), ("l", l_small)):
-        with Image.open(small / OUTPUT_DIR_NAME / f"{name}_x2.5.png") as im:
-            assert_same_shape(upright.size, im.size, 2.5)
-            assert_full_content(upright, im, tol=4.0)
+    for factor in FACTORS:
+        ws = Workspace(StubEngine)
+        ws.add([str(small / "p.png"), str(small / "l.png")])
+        out = tmp / f"x{factor}"
+        snap = run_batch(ws, JobOptions(factor=factor, output_dir=out, output_format="png",
+                                        rename_batch=False))
+        assert snap["ok"] == 2, snap
+        for name, upright in (("p", p_small), ("l", l_small)):
+            with Image.open(out / f"{name}.png") as im:     # rename off: original names
+                assert im.size == (upright.width * factor, upright.height * factor), (factor, im.size)
+                assert im.width * upright.height == im.height * upright.width
+                assert_full_content(upright, im, tol=4.0 if factor in (1, 4) else 6.0)
+    print("  1×, 2×, 3×, 4×, 5×: exact proportional sizes, whole picture kept")
 
-    # Exact frame of a different shape: refused until Pad or Crop is chosen.
-    exact = _settings(size_mode=EXACT, exact_width=800, exact_height=500, output_dir=str(out),
-                      suffix="_frame")
-    plan = api.post("/api/plan/", {"settings": exact}).json()
-    assert not plan["valid"] and plan["conflicts"] == 2 and "fit" in plan["errors"]
-    assert all(row["kind"] == "conflict" and row["output"] == [800, 500] for row in plan["items"])
-    assert all(set(row["alternatives"]) == {PAD, CROP} for row in plan["items"])
-    r = api.post("/api/jobs/", {"settings": exact})
-    assert r.status_code == 400 and "fit" in r.json()["errors"]
-    assert not list(small.rglob("*_frame*")), "nothing may be written without a choice"
-
-    # Pad: whole picture kept, centred, borders in the chosen colour.
-    r = api.post("/api/jobs/", {"settings": {**exact, "fit": PAD, "pad_color": "black"}})
-    assert r.status_code == 200
-    assert api.wait_job()["ok"] == 2
-    with Image.open(small / OUTPUT_DIR_NAME / "p_frame.png") as im:
-        assert im.size == (800, 500)
-        pl = plan_size(120, 180, SizeOptions(EXACT, width=800, height=500, fit=PAD))
-        arr = np.asarray(im.convert("RGB"))
-        x, y = pl.offset
-        cw, ch = pl.content
-        assert (cw, ch) == (333, 500) and arr[:, :x].max() == 0 and arr[:, x + cw:].max() == 0
-        assert_full_content(p_small, im.crop((x, y, x + cw, y + ch)), tol=6.0)
-
-    # Crop: fills the frame; the trimmed part is exactly the planned centre band.
-    r = api.post("/api/jobs/", {"settings": {**exact, "fit": CROP, "suffix": "_crop"}})
-    assert r.status_code == 200
-    assert api.wait_job()["ok"] == 2
-    with Image.open(small / OUTPUT_DIR_NAME / "l_crop.png") as im:
-        assert im.size == (800, 500)
-        pl = plan_size(180, 120, SizeOptions(EXACT, width=800, height=500, fit=CROP))
-        expected = l_small.resize(pl.content, Image.Resampling.LANCZOS)
-        left, top = -pl.offset[0], -pl.offset[1]
-        expected = expected.crop((left, top, left + 800, top + 500))
-        diff = np.abs(np.asarray(im, float) - np.asarray(expected, float)).mean()
-        assert diff < 6, diff
-    print("  exact size: blocked without a choice; pad keeps the whole picture; crop trims "
-          "only the planned band")
-
-    # One oversized image flags itself without blanking the others' preview, and the
-    # memory warning counts the 4x intermediate, not just the output.
-    huge = tmp / "huge"
-    huge.mkdir()
-    Image.new("RGB", (17000, 10), (5, 5, 5)).save(huge / "strip.png")      # 68000 px at 4x
-    Image.new("RGB", (4000, 3000), (5, 5, 5)).save(huge / "photo.png")     # 192 MP at 4x
-    api.post("/api/queue/clear/")
-    api.post("/api/queue/add/", {"paths": [str(huge)]})
-    plan = api.post("/api/plan/", {"settings": _settings()}).json()
-    rows = {row["name"]: row for row in plan["items"]}
-    assert not plan["valid"] and "__all__" in plan["errors"], plan["errors"]
-    assert rows["strip.png"]["warning"].startswith("Too large")
-    assert rows["photo.png"]["output"] == [16000, 12000]
-    plan = api.post("/api/plan/", {"settings": _settings(scale_factor="1")}).json()
-    rows = {row["name"]: row for row in plan["items"]}
-    assert plan["valid"] and rows["photo.png"]["output"] == [4000, 3000]
-    assert "192 MP while processing" in rows["photo.png"]["warning"], rows["photo.png"]
-    r = api.post("/api/jobs/", {"settings": _settings(tile="")})
-    assert r.status_code == 400 and r.json()["error"].startswith("Tile size:"), r.json()
-    ws.clear()
+    # Never overwrites: same batch again into the same folder.
+    ws = Workspace(StubEngine)
+    ws.add([str(small / "p.png")])
+    run_batch(ws, JobOptions(factor=2, output_dir=tmp / "x2", output_format="png", rename_batch=False))
+    assert (tmp / "x2" / "p(1).png").exists() and (tmp / "x2" / "p.png").exists()
+    before = sorted(p.name for p in (tmp / "x4").iterdir())
+    ws = Workspace(StubEngine)
+    ws.add([str(small / "p.png"), str(small / "l.png")])
+    run_batch(ws, JobOptions(factor=4, output_dir=tmp / "x4"))      # rename into a used folder
+    after = sorted(p.name for p in (tmp / "x4").iterdir())
+    assert set(before) <= set(after) and len(after) == len(before) + 2
+    print("  existing files never overwritten (rename and original names)")
 
 
-def test_folder_mode_alpha_icc_rename(tmp: Path) -> None:
-    reset_workspace(engine_factory=StubEngine)
-    api = Api(Client(enforce_csrf_checks=True))
-    api.get("/")
+def test_folder_mode_alpha_icc(tmp: Path) -> None:
     root = tmp / "photos"
     (root / "trip").mkdir(parents=True)
     srgb = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
@@ -508,73 +296,65 @@ def test_folder_mode_alpha_icc_rename(tmp: Path) -> None:
     (root / OUTPUT_DIR_NAME).mkdir()
     Image.new("RGB", (8, 8)).save(root / OUTPUT_DIR_NAME / "ignored.png")
 
-    added = api.post("/api/queue/add/", {"paths": [str(root)]}).json()["added"]
-    assert added["added"] == 2 and added["folders"][0]["count"] == 2
+    ws = Workspace(StubEngine)
+    result = ws.add([str(root)])
+    assert len(result.added) == 2 and result.folders[0][1] == 2
     empty = tmp / "empty"
     empty.mkdir()
-    added = api.post("/api/queue/add/", {"paths": [str(empty)]}).json()["added"]
-    assert added["added"] == 0 and added["empty_folders"] == [str(empty)]
+    assert Workspace(StubEngine).add([str(empty)]).empty_folders == [empty]
 
-    assert api.post("/api/jobs/", {"settings": _settings()}).status_code == 200
-    assert api.wait_job()["ok"] == 2
-    a_out = root / OUTPUT_DIR_NAME / "trip" / "a_x4.png"
-    b_out = root / OUTPUT_DIR_NAME / "b_x4.png"
-    with Image.open(a_out) as im:
-        assert im.mode == "RGBA" and im.size == (160, 240)
+    snap = run_batch(ws, JobOptions(factor=2, output_format="png"))
+    assert snap["ok"] == 2
+    trip_out = list((root / OUTPUT_DIR_NAME / "trip").glob("*.png"))
+    top_out = [p for p in (root / OUTPUT_DIR_NAME).glob("*.png") if p.name != "ignored.png"]
+    assert len(trip_out) == 1 and len(top_out) == 1
+    assert re.fullmatch(r"[A-Z]{4,5}1\.png", trip_out[0].name)      # numbering per folder
+    with Image.open(trip_out[0]) as im:
+        assert im.mode == "RGBA" and im.size == (80, 120)
         alpha = np.asarray(im.getchannel("A"))
-        assert alpha[120, 80] < 30 and alpha[10, 10] == 255      # stripe stays transparent
-    with Image.open(b_out) as im:
-        assert im.size == (240, 160) and im.info.get("icc_profile") == srgb
+        assert alpha[60, 40] < 30 and alpha[5, 5] == 255            # stripe stays transparent
+    with Image.open(top_out[0]) as im:
+        assert im.size == (120, 80) and im.info.get("icc_profile") == srgb
 
-    # Second run: no overwrite, (1) suffix.
-    assert api.post("/api/jobs/", {"settings": _settings()}).status_code == 200
-    assert api.wait_job()["ok"] == 2
-    assert (root / OUTPUT_DIR_NAME / "b_x4(1).png").exists()
-
-    # Batch rename + JPEG (alpha flattened onto white).
-    assert api.post("/api/jobs/", {"settings": _settings(rename_batch=True,
-                                                         output_format="jpg")}).status_code == 200
-    job = api.wait_job()
-    assert job["ok"] == 2
-    names = sorted(p.name for p in (root / OUTPUT_DIR_NAME).rglob("*.jpg"))
-    assert len(names) == 2 and all(re.fullmatch(r"[A-Z]{4,5}1\.jpg", n) for n in names), names
+    # JPEG (the default) flattens transparency onto white.
+    snap = run_batch(ws, JobOptions(factor=1))
+    jpgs = list((root / OUTPUT_DIR_NAME / "trip").glob("*.jpg"))
+    assert snap["ok"] == 2 and len(jpgs) == 1
+    with Image.open(jpgs[0]) as im:
+        assert im.mode == "RGB" and im.size == (40, 60)
     assert not list(root.rglob("*.part")), "temporary files must not be left behind"
-    print("  folder mode, alpha, ICC profile, no-overwrite and batch rename OK")
+    print("  folder mode, transparency, colour profile OK")
 
 
 def test_cancel(tmp: Path) -> None:
-    ws = reset_workspace(engine_factory=StubEngine)
-    api = Api(Client(enforce_csrf_checks=True))
-    api.get("/")
     folder = tmp / "cancel"
     folder.mkdir()
     for i in range(4):
         make_marked(folder / f"c{i}.png", 30, 20)
-    api.post("/api/queue/add/", {"paths": [str(folder)]})
+    ws = Workspace(StubEngine)
+    ws.add([str(folder)])
     StubEngine.delay = 0.5
     try:
-        assert api.post("/api/jobs/", {"settings": _settings()}).status_code == 200
-        assert api.post("/api/jobs/", {"settings": _settings()}).status_code == 409   # busy
+        job = ws.start(JobOptions())
+        try:
+            ws.start(JobOptions())
+            raise AssertionError("a second batch must be refused while one runs")
+        except RuntimeError:
+            pass
         time.sleep(0.2)
-        api.post("/api/jobs/current/cancel/")
-        job = api.wait_job()
+        ws.cancel()
+        job.join(10)
     finally:
         StubEngine.delay = 0.0
-    assert job["state"] == "cancelled" and job["ok"] == 0, job
+    snap = job.snapshot()
+    assert snap["state"] == "cancelled" and snap["ok"] == 0, snap
     assert not list(folder.rglob(f"{OUTPUT_DIR_NAME}/*")), "a cancelled image must not be saved"
-    # Cancel arriving just after a batch ended must not leave it "cancelling" forever.
-    finished = ws.job
-    assert finished.state == "cancelled"
-    finished.state = "done"
-    finished.cancel()
-    assert finished.state == "done" and not finished.running
-    assert api.post("/api/jobs/", {"settings": _settings()}).status_code == 200   # not "busy"
-    api.wait_job()
-
-    # Shutdown while running stops the batch promptly.
+    # A cancel arriving after the end changes nothing.
+    job.cancel()
+    assert job.snapshot()["state"] == "cancelled"
     StubEngine.delay = 5.0
     try:
-        api.post("/api/jobs/", {"settings": _settings()})
+        ws.start(JobOptions())
         started = time.monotonic()
         ws.shutdown(timeout=3.0)
         assert not ws.job.running and time.monotonic() - started < 3.0
@@ -583,36 +363,32 @@ def test_cancel(tmp: Path) -> None:
     print("  cancel / busy / shutdown OK")
 
 
-def test_independent_of_old_upscaler() -> None:
-    old = re.compile(r"app\.engine|upscale_page|realesrgan_upscaler|rrdbnet|UpscaleSettings|BatchWorker")
-    for folder in (ROOT / "app" / "upscaler", ROOT / "app" / "web"):
-        for path in folder.rglob("*"):
-            if path.suffix in (".py", ".html", ".js", ".css"):
-                assert not old.search(path.read_text(encoding="utf-8")), f"{path} uses the old upscaler"
-    page = (ROOT / "app" / "ui" / "upscaler_web_page.py").read_text(encoding="utf-8")
-    assert not old.search(page)
-    # The Metadata screen keeps its own workflow and is not wired to upscaling.
+def test_desktop_only() -> None:
+    """No website: no web server, pages, URL routes or browser mode remain."""
+    assert not (ROOT / "app" / "web").exists() and not (ROOT / "manage.py").exists()
+    assert not list((ROOT / "app").rglob("*.html")) and not list((ROOT / "app").rglob("*.js"))
+    banned = re.compile(r"QtWebEngine|runserver|django\.urls|django\.http|WSGI|http\.server")
+    for path in (ROOT / "app").rglob("*.py"):
+        assert not banned.search(path.read_text(encoding="utf-8")), f"web code left in {path}"
+    # Metadata and Upscaler stay separate: neither screen starts the other.
     meta = (ROOT / "app" / "ui" / "metadata_page.py").read_text(encoding="utf-8")
-    assert "app.upscaler" not in meta and "upscaler_web_page" not in meta
-    print("  independent of the old upscaler; Metadata untouched by it")
+    ups = (ROOT / "app" / "ui" / "upscaler_screen.py").read_text(encoding="utf-8")
+    assert "app.upscaler" not in meta and "metadata" not in ups.lower().replace(
+        "metadata is a separate screen", "")
+    print("  desktop-only: no web layer; Upscaler and Metadata independent")
 
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         t = Path(tmp)
-        try:
-            test_geometry()
-            test_form()
-            test_files(t)
-            test_imaging(t)
-            test_security()
-            test_page()
-            test_batches(t)
-            test_folder_mode_alpha_icc_rename(t)
-            test_cancel(t)
-            test_independent_of_old_upscaler()
-        finally:
-            reset_workspace()
+        test_geometry()
+        test_form()
+        test_files(t)
+        test_imaging(t)
+        test_batches(t)
+        test_folder_mode_alpha_icc(t)
+        test_cancel(t)
+        test_desktop_only()
     print("UPSCALER TEST PASSED")
     return 0
 

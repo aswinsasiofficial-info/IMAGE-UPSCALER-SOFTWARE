@@ -1,68 +1,26 @@
-"""Finding input images and deciding where each result is written.
+"""Deciding where each Upscaler result is written, and under which name.
 
-Keeps the behaviour Upscaler users already rely on:
-  * folders are scanned recursively, skipping the ``upscaled`` folder that
-    earlier runs created inside them;
   * images that came from an added folder save to
     ``<folder>/upscaled/<same relative subfolder>/``;
   * other images save beside the original or into the chosen output folder;
-  * nothing is ever overwritten — clashes get ``(1)``, ``(2)``, … suffixes;
-  * optional batch rename: one random 4-5 letter prefix + 1, 2, 3 … per folder.
+  * batch rename is the default: one random 4-5 letter prefix shared by the
+    batch + 1, 2, 3 … per output folder (e.g. KQATZ1.jpg, KQATZ2.jpg);
+  * nothing is ever overwritten — taken numbers are skipped, and kept
+    original names get ``(1)``, ``(2)``, … when they clash.
+
+Finding the input images is shared with the Metadata screen (app/imagefiles.py).
 """
 
 from __future__ import annotations
 
-import os
 import random
 import string
 from pathlib import Path
 from typing import Iterable
 
-IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"})
-OUTPUT_DIR_NAME = "upscaled"
+from app.imagefiles import IMAGE_SUFFIXES, OUTPUT_DIR_NAME, discover, path_key  # noqa: F401
+
 DEFAULT_OUTPUT_DIR = Path.home() / "Upscaled"
-INVALID_NAME_CHARS = frozenset('<>:"/\\|?*')
-
-
-def path_key(path: Path) -> str:
-    """Identity of a file on disk (case-insensitive on Windows)."""
-    try:
-        path = path.resolve()
-    except OSError:
-        path = path.absolute()
-    return os.path.normcase(str(path))
-
-
-def is_image(path: Path) -> bool:
-    return path.suffix.lower() in IMAGE_SUFFIXES and path.is_file()
-
-
-def _inside_output_dir(child: Path, root: Path) -> bool:
-    """True for files under ``root/upscaled`` (results of an earlier run)."""
-    try:
-        rel = child.relative_to(root)
-    except ValueError:
-        return False
-    return len(rel.parts) > 1 and rel.parts[0].lower() == OUTPUT_DIR_NAME
-
-
-def discover(paths: Iterable[Path]) -> list[Path]:
-    """Expand files and folders into a de-duplicated, order-preserving image list."""
-    found: list[Path] = []
-    for p in map(Path, paths):
-        if p.is_dir():
-            found.extend(c for c in sorted(p.rglob("*"))
-                         if is_image(c) and not _inside_output_dir(c, p))
-        elif is_image(p):
-            found.append(p)
-    seen: set[str] = set()
-    unique: list[Path] = []
-    for f in found:
-        key = path_key(f)
-        if key not in seen:
-            seen.add(key)
-            unique.append(f)
-    return unique
 
 
 def find_root(src: Path, roots: Iterable[Path]) -> tuple[Path, Path] | None:
@@ -95,8 +53,9 @@ def extension(output_format: str) -> str:
     return ".jpg" if output_format == "jpg" else ".png"
 
 
-def output_filename(src: Path, suffix: str, output_format: str) -> str:
-    return f"{src.stem}{suffix}{extension(output_format)}"
+def output_filename(src: Path, output_format: str) -> str:
+    """The original name with the output format's extension (batch rename off)."""
+    return f"{src.stem}{extension(output_format)}"
 
 
 def unique_path(path: Path) -> Path:

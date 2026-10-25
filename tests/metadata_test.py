@@ -22,9 +22,9 @@ from PIL import Image
 from PySide6.QtWidgets import QApplication
 
 from app.engine.metadata_settings import (
-    MetadataSettings, ImageMetadata, ProviderError, ADOBE_TITLE_MAX,
-    parse_model_json, sanitize_keywords, prepare_analysis_bytes,
-    DEFAULT_MODELS, GEMINI_MODELS, GROQ_MODELS,
+    MetadataSettings, ImageMetadata, ProviderError, ADOBE_TITLE_MAX, ADOBE_KEYWORDS_MAX,
+    ADOBE_CATEGORIES, parse_model_json, parse_category, build_prompt, sanitize_keywords,
+    prepare_analysis_bytes, DEFAULT_MODELS, GEMINI_MODELS, GROQ_MODELS,
 )
 from app.engine import metadata_providers
 from app.engine import metadata_export
@@ -129,18 +129,51 @@ def test_prepare_analysis_bytes(path_folder: Path) -> None:
 
 
 def test_csv_export(path_folder: Path) -> None:
+    many = [f"kw{i}" for i in range(60)]
     rows = [
-        (Path("a,b.png"), ImageMetadata("Nice, Title", "Desc with, commas", ["k1", "k2"])),
+        (Path("a,b.png"), ImageMetadata("Nice, Title", "Desc with, commas", ["k1", "k2", "K1"],
+                                        7, "release one.jpg, release two.jpg")),
         (Path("c.jpg"), ImageMetadata("", "", [])),
+        (Path("d.jpg"), ImageMetadata("Many", "not exported", many, "11 - Landscape")),
+        (Path('q"uote.jpg'), ImageMetadata('Say "hi"', "", ["a"], 99)),
     ]
     dest = path_folder / "out" / "metadata.csv"
     metadata_export.write_csv(rows, dest)
+    # Adobe Stock's template header, byte for byte (after the UTF-8 BOM).
+    assert dest.read_bytes().startswith(b"\xef\xbb\xbfFilename,Title,Keywords,Category,Releases\r\n")
     with dest.open(newline="", encoding="utf-8-sig") as fh:
         parsed = list(csv.reader(fh))
-    assert parsed[0] == metadata_export.CSV_HEADERS
-    assert parsed[1][:2] == ["a,b.png", "Nice, Title"]
-    assert parsed[1][3] == "k1, k2"
-    print("  csv export OK")
+    assert parsed[0] == metadata_export.CSV_HEADERS == [
+        "Filename", "Title", "Keywords", "Category", "Releases"]
+    assert all(len(r) == 5 for r in parsed), parsed      # commas never add columns
+    assert parsed[1] == ["a,b.png", "Nice, Title", "k1, k2", "7",
+                         "release one.jpg, release two.jpg"], parsed[1]
+    assert parsed[2] == ["c.jpg", "", "", "", ""], parsed[2]     # no category/release → blank
+    assert parsed[3][2].split(", ") == many[:49] and parsed[3][3:] == ["11", ""], parsed[3]
+    assert parsed[4] == ['q"uote.jpg', 'Say "hi"', "a", "", ""], parsed[4]  # 99 isn't a category
+    print("  csv export (Adobe Stock template, 49 keywords, quoting) OK")
+
+
+def test_categories_and_prompt() -> None:
+    assert len(ADOBE_CATEGORIES) == 21 and ADOBE_CATEGORIES[11] == "Landscape"
+    assert ADOBE_KEYWORDS_MAX == 49
+    for value, expected in ((7, 7), ("7", 7), ("11 - Landscape", 11), ("Landscape", 11),
+                            ("food", 7), (21.0, 21), (0, None), (22, None), (7.5, None),
+                            (True, None), (None, None), ("", None), ("Nature", None)):
+        assert parse_category(value) == expected, (value, parse_category(value))
+
+    prompt = build_prompt(_settings(keyword_count=49))
+    assert '"category"' in prompt and "1 Animals" in prompt and "21 Travel" in prompt
+    assert "up to 49" in prompt and "most important first" in prompt
+    assert "release" not in prompt.lower()                  # never asked to invent releases
+
+    meta = parse_model_json('{"title": "T", "keywords": ["a"], "category": "14", '
+                            '"releases": "made-up.jpg"}', _settings())
+    assert meta.category == 14 and meta.releases == "", meta
+    assert parse_model_json('{"title": "T", "keywords": ["a"], "category": 40}',
+                            _settings()).category is None
+    assert ImageMetadata.from_dict(meta.as_dict()) == meta
+    print("  categories, prompt and category parsing OK")
 
 
 def test_embed_roundtrip(path_folder: Path) -> None:
@@ -815,6 +848,7 @@ def main() -> int:
             test_parse_and_sanitize()
             test_prepare_analysis_bytes(folder)
             test_csv_export(folder)
+            test_categories_and_prompt()
             test_embed_roundtrip(folder)
             test_credential_store()
             test_retry_classification()

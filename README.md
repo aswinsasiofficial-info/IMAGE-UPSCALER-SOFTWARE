@@ -1,372 +1,251 @@
-# Batch Image Upscaler (Real-ESRGAN x4plus) + Metadata Generator
+# Batch Upscaler & Metadata Generator
 
-A local, GPU-accelerated desktop app for **batch-upscaling images** (4× by
-default) with the **Real-ESRGAN `x4plus`** model, built on **PyTorch + CUDA** —
-every image keeps its own aspect ratio and its whole picture — plus a separate
-**Metadata Generator** screen that writes Adobe Stock–ready titles, descriptions
-and keywords with **Gemini**, **Groq** or **Ollama** (your own local server *or*
-Ollama's hosted cloud).
+A local Windows **desktop app** with two separate tools:
 
-Upscaling runs entirely on your machine — no uploads, no accounts, no internet
-needed after the model weights are downloaded once. The Metadata screen calls
-your chosen provider API only for the images you explicitly select there (local
-Ollama keeps even those on your computer); the two features are independent
-(upscale and save first, then generate metadata for the saved files).
+- **Upscaler** — enlarges images **1×–5×** with the **Real-ESRGAN `x4plus`**
+  model on **PyTorch + CUDA**. Every image keeps its own aspect ratio and its
+  whole picture.
+- **Metadata** — writes Adobe Stock–ready titles, descriptions and keywords
+  with **Gemini**, **Groq** or **Ollama** (your own local server *or* Ollama's
+  hosted cloud), and exports them as CSV.
+
+The two never trigger each other: upscale and save first, then open
+**Metadata** and choose the images or folder you want to describe. Upscaling
+runs entirely on your machine; the Metadata screen only contacts the provider
+you pick, for the images you pick (local Ollama keeps even those on your PC).
+There is no website or web server — it's a desktop program.
 
 ---
 
-## Features
+## Upscaler
 
-- **Batch processing** — queue 20-30+ images at once (files or whole folders,
-  recursively). The model is loaded **once** and reused for every image.
-- **Folder mode** — when you add a folder, its results are saved inside
-  `<folder>/upscaled/` with the subfolder structure preserved (so
-  `photos/trip/image.jpg` → `upscaled/photos/trip/image_x4.jpg`), and that
-  output folder is skipped on later scans so results are never re-processed.
-- **Real-ESRGAN x4plus** — high-quality 4× super-resolution for photos,
-  screenshots, artwork and anime-style images.
-- **CUDA + fp16** — runs on the GPU in half precision for speed and lower VRAM.
-- **VRAM-safe tiling** — large images are automatically split into overlapping
-  tiles so they fit in 6 GB of VRAM (no out-of-memory crashes on big photos).
-- **RGBA / transparency preserved** — alpha channels are upscaled cleanly.
-- **Shape always preserved** — width and height are multiplied by the *same*
-  factor (default **4×**; 1–8× allowed), so nothing is ever cropped, stretched,
-  zoomed or distorted by default. A 1024 × 1536 portrait at 4× becomes exactly
-  4096 × 6144; a 1536 × 1024 landscape becomes 6144 × 4096.
-- **Output sizes shown before processing** — every queued image lists its
-  original size and shape and the exact pixel size it will be saved at, with a
-  small diagram of the result for the selected image.
-- **Optional exact size, never silent** — if you type a fixed W × H and an
-  image has a different shape, the app says so (how many images, by how much)
-  and refuses to start until you explicitly pick **Pad to fit** (whole picture
-  kept, borders in white/black/transparent) or **Crop to fill** (frame filled,
-  edges trimmed — the exact pixels lost are shown). There is no stretch option.
-- **PNG or JPEG output**, custom output folder (or save beside originals),
-  configurable suffix, optional batch rename, live progress bar, per-image
-  logging and cancel. Embedded RGB colour profiles (e.g. Display P3) are kept.
-- **Drag & drop** or browse to add images.
-- **Django-based Upscaler screen** — the Upscaler is a Django app served by a
-  private local server inside the desktop app (127.0.0.1 only, fresh access
-  token each launch) and shown in the window with Qt WebEngine, using the
-  app's own palette. Native file dialogs and message boxes still come from the
-  desktop app.
+- **Factors 1×, 2×, 3×, 4×, 5×** — the same factor is applied to width and
+  height, so nothing is cropped, stretched, zoomed or distorted. 1× keeps the
+  original size; a 1024 × 1536 image at 4× becomes exactly 4096 × 6144.
+- **Honest about the model** — Real-ESRGAN x4plus has exactly one native scale,
+  **4×** (its network ends in two fixed 2× upsampling stages). The screen says
+  how each factor is produced:
+  - **4×** — native.
+  - **1×, 2×, 3×** — the model runs at 4×, then the result is reduced with a
+    high-quality Lanczos filter (1× = a clean-up at the original size).
+  - **5×** — the model runs at 4×; the last step is ordinary Lanczos
+    interpolation, which adds pixels but no new detail.
 
-### Metadata Generator (separate screen, top-nav **Metadata**)
+  More pixels don't automatically mean more real detail: the AI reconstructs
+  plausible detail, it can't recover what the original never captured.
+- **See it before you run it** — every queued image shows its thumbnail, its
+  original size and shape, and the exact pixel size it will be saved at; the
+  selected image is shown large. Outputs that would be too large (over
+  65,500 px a side) or need a lot of memory are flagged.
+- **JPEG by default** (quality 95), PNG optional — PNG keeps transparency;
+  JPEG flattens it onto white.
+- **Batch rename by default** — one random 4–5 letter prefix for the batch,
+  numbered from 1 in each output folder (`KQATZ1.jpg`, `KQATZ2.jpg`, …). Untick
+  it to keep the original names. **Existing files are never overwritten** —
+  taken numbers are skipped, kept names get `(1)`, `(2)`, ….
+- **Folder mode** — images from an added folder save to `<folder>/upscaled/`
+  with subfolders preserved; that folder is skipped on later scans.
+- **Fast and safe on a 6 GB GPU** — the model loads once per batch, runs in
+  fp16 with overlapping tiles, writes into an 8-bit canvas, and if CUDA still
+  runs out of memory the tile size is halved and the image retried.
+- EXIF rotation, transparency and RGB colour profiles (e.g. Display P3) are kept.
 
-- **Adobe-ready metadata per image** — title (≤ 70 chars), description and
-  keywords generated by AI from the picture itself. Ollama providers are asked
-  for **exactly 50 keywords** (a full Adobe set); Gemini/Groq keep the previous
-  "up to 45" wording.
-- **Four provider choices** — Google **Gemini** (official SDK), **Groq**
-  (OpenAI-compatible vision models), **Ollama (Local)** and **Ollama Cloud**.
-  Pick provider, model, language and keyword count in the panel.
-- **Ollama (Local)** — talks to an Ollama server on your own machine
-  (`http://localhost:11434` by default). **No API key, no account, no upload:**
-  the image bytes are only sent to that local address. Press
-  **Check Connection & Vision Models** to confirm the server is reachable and
-  to list the installed models that can actually read images.
-- **Ollama Cloud** — uses Ollama's hosted API at `https://ollama.com` with a
-  Bearer key. The screen says explicitly that every image is **uploaded to a
-  hosted service**, and the model list is fetched for *your* account
-  (`/api/tags` + the `vision` capability), because cloud availability is not
-  the same for every plan.
-- **Tuned for small local models** — Ollama requests are sent with
-  `think: false` (a reasoning model otherwise spends the whole answer budget on
-  hidden thinking and returns nothing visible), a generous answer budget, and a
-  JSON-only reply. If a model answers with a slightly short keyword list
-  (up to 12 of the 50 missing), one cheap follow-up request tops it up; the
-  metadata that already arrived is never thrown away.
-- **Secure API keys** — typed keys stay masked, each provider keeps its own
-  key, and they are optionally remembered in the **Windows Credential Manager**
-  (`keyring`) or via the `GEMINI_API_KEY` / `GROQ_API_KEY` / `OLLAMA_API_KEY`
-  environment variables. Local Ollama is refused a key by design. Keys are
-  never written to exports.
-- **Visual grid preview** of every selected image with per-image status
-  (pending / generating / done / failed) and error tooltips.
-- **Everything editable** — change title/description/keywords before export;
-  failed or selected items can be **retried / regenerated** individually.
-- **Final review step** — a review table with validation warnings before any
-  file is written.
-- **Exports** — contributor-friendly **CSV** (`Filename, Title, Description,
-  Keywords`) and/or **embedding into the images themselves** (PNG tEXt chunks
-  / JPEG comment — as copies or in place) as an explicit opt-in.
+## Metadata
 
-## Requirements
+- **Images and folders** — add images, or a folder: a **folder batch holds up
+  to 25 images**. If a folder has more, a chooser shows all of them as
+  thumbnails (the first 25 ticked) and you pick up to 25.
+- **One tile per image** — thumbnail, filename, status (not generated /
+  generating / done / failed), keyword count and title, or the error. Filters
+  (All / Pending / Done / Failed) with counts; overall progress below.
+- **Large preview + editor** — the selected image next to its editable title,
+  description, keywords, Adobe Stock **category** (suggested by the AI, pick
+  another from the list) and **releases** (blank unless you type the release
+  file names — the AI never fills them), with counters against Adobe's limits.
+  Edits are kept per image.
+- **Automatic retries, failed images only** — temporary problems (rate limits,
+  timeouts, provider 5xx) are retried automatically with growing waits, only
+  for the images that failed; finished images are never regenerated.
+  Permanent problems (invalid key, missing model, unsupported image, a local
+  server that isn't running) stop right away with an explanation.
+- **Complete CSV only** — once *every* image in a folder batch has metadata,
+  `metadata.csv` is saved into that folder automatically. If any image is
+  still unsuccessful, or the batch is cancelled, no partial CSV is written.
+- **Export** — saves the current metadata, including your edits, straight to
+  CSV. It asks where only if no location is chosen yet (after an automatic
+  save it updates that file); *Export As…* picks another. The same menu offers
+  **Embed Metadata into Images…** (PNG tEXt / JPEG comment — as copies or in
+  place; this is where the description goes).
+- **Adobe Stock CSV format** — exactly the template's columns, in order:
+  `Filename,Title,Keywords,Category,Releases`. Keywords share one cell,
+  comma-separated, most important first, at most 49 (extra ones are left out
+  and the banner says so); Category is the category number (1–21); Releases is
+  blank unless you entered it. Values with commas or quotes are quoted, so a
+  keyword list never spills into extra columns. UTF-8 with BOM, so Excel shows
+  non-English text correctly.
+- **Providers** — Google **Gemini** (official SDK), **Groq** (OpenAI-compatible
+  vision models), **Ollama (Local)** (`http://localhost:11434`, no key, nothing
+  uploaded — the check button lists installed models that can read images) and
+  **Ollama Cloud** (hosted, Bearer key; the screen says that images are
+  uploaded). Ollama asks for exactly 49 keywords; Gemini/Groq up to 45.
+- **Keys** — typed keys stay masked, each provider keeps its own key, optionally
+  remembered in the **Windows Credential Manager** or read from
+  `GEMINI_API_KEY` / `GROQ_API_KEY` / `OLLAMA_API_KEY`. Keys are never exported.
 
-- Windows with an **NVIDIA GPU** and a **CUDA 12.x driver** (RTX 3050 works).
-- **Python 3.10+** (developed/tested on 3.14).
-- ~4 GB free disk space for the CUDA PyTorch wheel + dependencies.
-- Internet on first run (PyTorch download, then one-time 67 MB weight download).
-- For the Metadata screen only: an API key from [Google AI Studio](https://aistudio.google.com)
-  (Gemini), [Groq](https://console.groq.com) or an [Ollama Cloud](https://ollama.com)
-  account + key — and the optional deps below (installed by `setup.ps1` /
-  `requirements.txt` automatically).
-- For **Ollama (Local)** instead: [Ollama](https://ollama.com/download) installed
-  and running on this machine, plus one vision-capable model pulled locally
-  (for example `ollama pull gemma4`). No account, no key and no internet access
-  are needed for the images themselves — only enough RAM/VRAM for the model,
-  which is slow on CPU and comfortable on a GPU.
+## Design
 
-## Setup (one time)
+- **Inter Tight** everywhere (bundled, SIL Open Font License), one colour
+  palette for light and dark mode (follows Windows; `UPSCALER_THEME=light|dark`
+  forces one), consistent cards, buttons and spacing on both screens.
+- **Icon buttons** (Lucide icons, ISC license) replace long button text. Each
+  has a tooltip that says what it does (and its shortcut) and an accessible
+  name for screen readers.
+- **Keyboard** — `Ctrl+1` / `Ctrl+2` switch screens; `Ctrl+O` add images,
+  `Ctrl+Shift+O` add a folder, `Del` remove selected, `Ctrl+Enter`
+  Upscale / Generate, `Esc` cancel, `Ctrl+E` export.
+- Layouts adapt to the window size (the Metadata screen shows the editor and
+  provider settings as tabs when narrower).
 
-Open PowerShell in this folder and run:
+## Get the app
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\setup.ps1
-```
+### Packaged app (no Python needed)
 
-This creates a `.venv`, installs the **CUDA 12.6** build of PyTorch, PySide6,
-Pillow, NumPy and Django, then prints whether CUDA is detected. If it says
-`CUDA available: True`, you're good.
+Build it once (see below), then copy the `dist\BatchUpscaler` folder anywhere
+and start **`BatchUpscaler.exe`**. The folder contains everything — Python,
+PyTorch with CUDA, Qt, the fonts and icons, and the model weights — so it works
+offline. An NVIDIA GPU with a current driver is used automatically; without
+one it runs on the CPU (much slower).
 
-<details>
-<summary>Manual setup</summary>
+### From source
+
+Requirements: Windows, an NVIDIA GPU with a CUDA 12.x driver (an RTX 3050
+works; CPU also works, slowly), Python 3.10+ (developed on 3.14) and about
+4 GB of disk for the CUDA PyTorch download.
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-.\.venv\Scripts\python.exe -m pip install PySide6 Pillow numpy "Django>=5.2"
-.\.venv\Scripts\python.exe -m pip install google-genai requests keyring  # optional: Metadata screen
+powershell -ExecutionPolicy Bypass -File .\setup.ps1   # once: creates .venv and installs everything
+.\run.bat                                              # or .\run.ps1
 ```
-</details>
 
-## Run
+`setup.ps1` installs the CUDA 12.6 build of PyTorch, PySide6, Pillow, NumPy,
+Django and the Metadata providers, then prints whether CUDA is detected. On
+the first upscale the app downloads `RealESRGAN_x4plus.pth` (67 MB) into
+`models/`.
 
-Double-click **`run.bat`**, or from PowerShell:
+### Build the packaged app
 
 ```powershell
-.\run.ps1
+powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-Then:
+Uses PyInstaller from the `.venv` to make `dist\BatchUpscaler\BatchUpscaler.exe`
+(a one-folder app, several GB because of CUDA PyTorch), copies the model
+weights next to it, then runs the packaged app's self-test. You can repeat the
+self-test any time:
 
-1. **Add Images…** / **Add Folder…** (or drag & drop onto the window).
-2. Pick an **output folder**, or tick **Save beside each original**. Images
-   brought in via **Add Folder…** always go to `<folder>/upscaled/` instead,
-   keeping each image's relative subfolder path (this takes precedence for
-   those files).
-3. Choose **Device** (CUDA), keep **fp16** on, and a **tile size** (256 is the
-   recommended default for a 6 GB GPU; `0` = no tiling).
-4. Under **Output size**, keep **Scale by 4×** (or pick another factor) — the
-   queue shows every image's output size, e.g. `1024 × 1536 → 4096 × 6144`.
-   Choose **Exact size** only if you need a fixed W × H: images whose shape
-   differs are flagged, and you must pick **Pad to fit** or **Crop to fill**
-   before the batch can start (**Match selected image's shape** sets a height
-   that needs neither).
-5. Click **Start Upscaling**. Watch the progress bar and log; **Cancel** anytime.
+```powershell
+dist\BatchUpscaler\BatchUpscaler.exe --self-test report.json
+```
 
-On the very first run the app downloads `RealESRGAN_x4plus.pth` into `models/`
-and shows download progress in the status bar.
+It checks the font and icons, PyTorch/CUDA, and runs the real model at every
+factor 1×–5× (sizes, aspect ratio, JPEG + batch names), writing the results
+to `report.json` (exit code 0 = passed).
 
-### Metadata Generator — step by step
+## How to use
 
-1. Upscale your images first and note where they were saved.
-2. Click **Metadata** in the top navigation.
-3. **Add Images… / Add Folder…** (or drag & drop) to pick the saved images —
-   each appears as a preview tile.
-4. Choose the **provider**:
-   - **Gemini / Groq / Ollama Cloud** — enter the **API key** (tick *Remember*
-     to store it in the Windows Credential Manager). Each provider keeps its own
-     key; switching providers never reuses another one's.
-   - **Ollama (Local)** — no key at all. Set the server address if it is not
-     `http://localhost:11434`, start Ollama, then press **Check Connection &
-     Vision Models**: the model box is refilled with only the installed models
-     that can read images, and the notice tells you what happens to your files.
-5. **Generate Metadata** — watch per-image status; use **Retry Failed** or
-   select tiles + **Regenerate Selected** when needed. Temporary problems
-   (rate limits, timeouts, provider 5xx) are retried automatically with growing
-   waits and only for the images that failed; permanent problems (missing model,
-   dead local server, bad key, unsupported image) stop immediately with an
-   explanation. Edit any title / description / keywords in the editor below the
-   grid — each tile keeps its own text.
-6. **Review & Export…** — check every row in the review table, then export a
-   contributor CSV and/or embed the metadata into the PNG/JPEG files (copies
-   or in place — your explicit choice).
-   When a **folder** was added, a complete `metadata.csv` is written into that
-   folder automatically as soon as *every* image in the batch succeeded — never
-   a partial one after a failure or a cancel.
+**Upscaler** — add images or a folder (or drop them on the window), pick a
+factor, check the sizes in the list, choose where to save, and press
+**Upscale**. Watch the progress bar; open the activity log for details;
+**Cancel** stops after the current tile and keeps finished images.
 
-## How it works
+**Metadata** — switch to **Metadata**, add images or a folder (≤ 25 images per
+folder batch), choose the provider (enter a key, or use Ollama locally), press
+**Generate**. Select an image (or use the **Failed** filter) to see what went
+wrong; fix it and use **Retry failed**. Edit anything, then **Export**.
 
-| Concern | Approach |
+## Tests
+
+All run from the project folder with `.\.venv\Scripts\python.exe -m tests.<name>`:
+
+| Test | What it checks |
 |---|---|
-| UI | Django app (`app/upscaler`) on a private local server (`app/web`), shown in the window by Qt WebEngine (`app/ui/upscaler_web_page.py`). The queue, size plan and batch live server-side, so the previewed sizes come from the same code that writes the files. |
-| Model | Self-contained `RRDBNet` (`app/upscaler/network.py`, identical architecture to the official `RealESRGAN_x4plus.pth`), so we avoid the `basicsr`/`realesrgan` packages that break on modern torchvision. |
-| Batching | One model load for the whole queue; images are processed back-to-back on the GPU. |
-| VRAM | Tile-based inference with an overlap pad (`tile=256`, `pad=16`) bounds peak memory; results go straight into an 8-bit canvas, and a CUDA out-of-memory error halves the tile and retries. |
-| Speed | `torch.inference_mode` + fp16 + cuDNN on the RTX 3050. |
-| Transparency | RGB is upscaled by the network; the alpha channel is resized with bicubic and recombined. |
-| Output size | `app/upscaler/geometry.py` plans every image: the model always gives exactly 4×; any other factor is one Lanczos resize with the same factor on both axes. Exact sizes either match the image's shape, or use the pad/crop the user explicitly picked. Each saved file is re-opened to confirm it has the planned size. |
+| `upscaler_test` | No model: 1×–5× sizes and the factor explanations, the Django settings form, real batches for portrait/landscape at every factor (size, shape, whole picture via shrink-back + corner markers), JPEG + rename defaults, no overwriting, folder mode, transparency, colour profiles, cancel — and that no web server/website remains |
+| `upscaler_ui_test` | The Upscaler screen in the real window (offscreen): defaults, removed options, Inter Tight, every icon button has an icon + tooltip + accessible name, thumbnails and preview, sizes for 1×–5×, a batch run from the Upscale button, the too-large message |
+| `upscaler_model_test` | The real Real-ESRGAN network at every factor on portrait, landscape, EXIF-rotated and transparent images (`--example` adds 1024 × 1536 → 4096 × 6144) |
+| `metadata_ui_test` | Export (edits included, asks once, Export As), 25-image folder batches with automatic retries of failed images only, complete-only CSV (not after a failure or cancel), the 25-image limit and chooser, thumbnails, filters, layouts |
+| `metadata_test`, `ollama_test` | Providers, parsing, retries, credentials, CSV/embedding, Ollama local + cloud — all with network calls stubbed |
 
-### Tuning for your GPU
-
-- **RTX 3050 6 GB (yours):** keep **tile = 256**. If you hit an out-of-memory
-  error on an enormous image, lower it (e.g. `192`/`128`). Larger tiles = fewer
-  seams but more VRAM.
-- **More VRAM / faster:** `384`–`512` on 8-12 GB cards.
-- **`tile = 0`:** process the whole image in one pass — only safe for small
-  inputs; disables tiling.
-
-## Verify the engine (optional, no GUI)
-
-```powershell
-.\.venv\Scripts\python.exe -m tests.upscaler_test
-```
-
-The Upscaler without the model (a pixel-exact 4× stand-in replaces the
-network): size planning for portrait/landscape/odd shapes and factors, the
-settings form (pad/crop required on a shape conflict, no stretch), the Django
-API with its launch token, CSRF and host checks, and full batches that write
-real files — each output's size and aspect ratio are checked, and shrinking it
-back must reproduce the source with the corner markers in the right corners
-(nothing cropped or shifted). Also folder mode, no-overwrite, batch rename,
-alpha, colour profiles, cancel, and that none of it uses the old upscaler.
-
-```powershell
-.\.venv\Scripts\python.exe -m tests.upscaler_model_test            # add --example for 1024×1536 → 4096×6144
-```
-
-Runs portrait, landscape, EXIF-rotated and transparent images through the real
-Real-ESRGAN network (downloads the weights once), at 4×, 2× and an exact size
-with pad and crop, and checks every result lines up with its source.
-
-```powershell
-.\.venv\Scripts\python.exe -m tests.upscaler_desktop_test
-```
-
-Builds the real window offscreen: both screens present, the local server only
-starts when the Upscaler is shown, native dialogs requested by the page open on
-the GUI thread, Explorer drops reach the queue, and — where Qt WebEngine can
-render offscreen — Start is clicked in the actual page (blocked on a shape
-conflict until Pad is chosen) and the files are checked.
-
-`tests.smoke_test`, `tests.target_size_test`, `tests.worker_batch_test`,
-`tests.folder_mode_test` and `tests.batch_rename_test` exercise the previous
-upscaler implementation, which the app no longer uses (see *Project layout*).
-
-```powershell
-.\.venv\Scripts\python.exe -m tests.metadata_test
-```
-
-Covers the Metadata Generator without any network: JSON parsing/sanitising,
-in-memory image pre-flight, CSV export, PNG/JPEG embed round-trip, credential
-lookup order, retry classification, the worker with a stubbed provider, per-item
-editor isolation, the folder-batch auto-CSV rule, and an offscreen smoke build of
-both screens.
-
-```powershell
-.\.venv\Scripts\python.exe -m tests.ollama_test
-```
-
-Covers both Ollama modes with every HTTP call stubbed (no Ollama install, no
-key, no network): the official `/api/chat` request shape with base64 `images`
-for local and cloud (including the `think: false` field and the retry without
-it for older servers), key isolation (`OLLAMA_API_KEY` only, local refused a
-key), the "exactly 50 keywords" target plus the keyword top-up, model-name
-resolution for quantised local tags, vision-model discovery through `/api/tags`
-+ `/api/show` (and a check that a stopped lookup makes no further calls),
-permanent-vs-temporary error classification including a truncated-JSON reply,
-batch retry passes that keep successful rows, and CSV export only after the
-whole folder batch succeeds.
+`smoke_test`, `target_size_test`, `worker_batch_test`, `folder_mode_test` and
+`batch_rename_test` cover the previous upscaler modules, which the app no
+longer uses.
 
 ## Project layout
 
 ```
 app/
-  main.py                     # GUI entry point (python -m app.main)
-  upscaler/                   # the Upscaler — a Django app
-    geometry.py               # output-size planning: scale / exact + pad/crop
-    imaging.py                # EXIF-aware load, compose (resize/pad/crop), save
-    network.py                # Real-ESRGAN x4plus network (RRDBNet)
-    engine.py                 # weights, device, tiled inference, OOM fallback
-    files.py                  # folder scan, folder mode, naming, no-overwrite
-    workspace.py              # queue + background batch (progress, log, cancel)
-    forms.py                  # settings validation (pad/crop rule)
-    views.py · urls.py        # page + JSON API
-    host.py                   # hooks the desktop lends it (dialogs, palette)
-    templates/ · static/      # the page (HTML, CSS, JS)
-  web/                        # Django project for the embedded server
-    settings.py · urls.py
-    middleware.py             # per-launch access token
-    server.py                 # 127.0.0.1 server in a background thread
+  main.py                 # entry point (python -m app.main / BatchUpscaler.exe; --self-test)
+  selftest.py             # headless check of a source or packaged build
+  paths.py                # bundled assets and model folder (source vs packaged)
+  design.py               # colours, font, radii (light + dark)
+  imagefiles.py           # finding supported images (shared by both screens)
+  assets/                 # Inter Tight font, Lucide icons, app icon (+ licenses)
+  upscaler/
+    geometry.py           # 1×–5× size planning + how each factor is produced
+    engine.py · network.py  # Real-ESRGAN x4plus: weights, device, tiles, OOM retry
+    imaging.py            # EXIF-aware load, resize to plan, atomic save
+    files.py              # output folders, batch rename, no overwrite
+    workspace.py          # queue + background batch (progress, log, cancel)
+    forms.py              # settings validation (Django forms, standalone)
   engine/
-    metadata_settings.py      # metadata dataclasses, limits, JSON parsing
-    metadata_providers.py     # Gemini/Groq/Ollama calls with retry + backoff
-    metadata_worker.py        # QThread metadata batch + Ollama lookup runners
-    metadata_export.py        # contributor CSV writer + PNG/JPEG embedder
-    credential_store.py       # API keys: session → env → Windows keyring
-    worker.py                 # previous upscaler's batch runner; the Metadata
-                              #   screen still imports its image-folder scanner
-    realesrgan_upscaler.py    # previous upscaler (not used by the app any more)
-    rrdbnet.py                # previous upscaler (not used by the app any more)
+    metadata_settings.py · metadata_providers.py · metadata_worker.py
+    metadata_export.py · credential_store.py
+    worker.py · realesrgan_upscaler.py · rrdbnet.py   # previous upscaler (unused)
   ui/
-    main_window.py            # shell: top navigation + stacked feature pages
-    upscaler_web_page.py      # Upscaler screen: embeds the Django page
-    upscale_page.py           # previous upscaler screen (not used any more)
-    metadata_page.py          # Metadata Generator screen
-    metadata_review.py        # final review table + export options
+    main_window.py        # top navigation + the two screens
+    upscaler_screen.py    # Upscaler screen
+    metadata_page.py      # Metadata screen
+    folder_picker.py      # choose up to 25 images of a big folder
+    widgets.py · icons.py · thumbnails.py · theme.py
+    upscale_page.py       # previous upscaler screen (unused)
+packaging/                # PyInstaller spec, launcher, icon generator
 tests/
-  upscaler_test.py            # Upscaler: planning, form, API, batches (no model)
-  upscaler_model_test.py      # Upscaler with the real Real-ESRGAN network
-  upscaler_desktop_test.py    # Upscaler inside the real window (offscreen)
-  metadata_test.py            # metadata engine/worker/UI checks (no network)
-  ollama_test.py              # Ollama local + cloud provider/worker/UI checks
-  smoke_test.py · target_size_test.py · worker_batch_test.py ·
-  folder_mode_test.py · batch_rename_test.py   # previous upscaler
-models/                       # downloaded weights (auto-created)
-manage.py                     # Django checks / standalone dev server
-setup.ps1 · run.bat · run.ps1 · requirements.txt
+setup.ps1 · run.bat · run.ps1 · build.ps1 · requirements.txt
 ```
 
 ## Troubleshooting
 
-- **`CUDA available: False`** → update your NVIDIA driver, or the installed
-  torch is the CPU build. Reinstall with the `cu126` index command above.
-- **Out of memory** → the Upscaler halves the tile size and retries on its own;
-  if it still fails, reduce **Tile size**, keep **fp16** enabled.
-- **Upscaler screen says the embedded browser isn't available** → Qt WebEngine
-  is missing (e.g. only `PySide6-Essentials` installed). Reinstall the full
-  `PySide6` package, or use the **Open Upscaler in Browser** button meanwhile —
-  it is the same local page, and file dialogs still open from the app.
-- **"Choose Pad or Crop" when starting** → you set an **Exact size** whose
-  shape differs from some images. Pick how to handle them, switch back to
-  **Scale by**, or press **Match selected image's shape**.
-- **App won't launch** → ensure you ran `setup.ps1`; run `run.bat` from this
-  folder. Check the console output for the Python error.
-- **Weights download blocked** → manually place `RealESRGAN_x4plus.pth` from the
-  [official release](https://github.com/xinntao/Real-ESRGAN/releases) into the
-  `models/` folder.
-- **Metadata: 401/403** → wrong or expired API key for the chosen provider.
-- **Metadata: 404 “no longer available”** → the model was retired; the error
-  message names the replacement — type it into the (editable) model box.
-- **Metadata: package not installed** → run
-  `.venv\Scripts\python -m pip install google-genai requests keyring`.
-- **Ollama (Local): “Ollama is not running on this computer”** (or
-  *“No Ollama server answered at …”*) → start the Ollama app (or `ollama serve`),
-  confirm `ollama list` shows a model, and press **Check Connection & Vision
-  Models** again. This is never retried — there is nothing to retry until the
-  server is up.
-- **Ollama (Local): “none of its model(s) can analyse images”** → the installed
-  models are text-only. Pull one that takes images, e.g. `ollama pull gemma4`.
-- **Ollama (Local): very slow first image** → the model is loading into
-  RAM/VRAM; later images in the same batch are much faster (CPU-only models
-  can take minutes per image).
-- **Ollama: “answered with no text”** → the model refused the image or ran out
-  of answer space. The app already requests `think: false`, so an older Ollama
-  build or a very small model is the usual cause; run **Check Connection &
-  Vision Models** and pick a different image-capable model.
-- **Ollama: “no complete JSON object”** → the reply was cut off or wrapped in
-  prose. This counts as a *temporary* failure, so the image is retried with
-  growing waits on its own; if it repeats after all passes, choose a larger
-  model or lower the keyword count.
-- **Ollama Cloud: 402 / “rejected your API key”** → the account has no plan or
-  credits for that model, or the key is wrong. Create a key at
-  <https://ollama.com/settings/keys> and check usage/plan on the same account —
-  cloud access is not free and not every account can reach every model.
+- **`CUDA available: False`** → update the NVIDIA driver, or the CPU build of
+  torch is installed; reinstall with the `cu126` command in `setup.ps1`.
+- **Out of memory** → the Upscaler halves the tile size and retries by itself;
+  if it still fails, lower **Tile size** and keep **fp16** on.
+- **"…would be larger than 65,500 px on a side"** → pick a smaller factor for
+  that image (JPEG can't be bigger, and PNGs that size need huge amounts of RAM).
+- **App won't start (from source)** → run `setup.ps1` first, then `run.bat`
+  from this folder; the console shows the Python error.
+- **Weights download blocked** → put `RealESRGAN_x4plus.pth` from the
+  [official release](https://github.com/xinntao/Real-ESRGAN/releases) into
+  `models\` (next to `BatchUpscaler.exe` for the packaged app).
+- **Metadata: 401/403** → wrong or expired API key for that provider.
+- **Metadata: 404 "no longer available"** → the model was retired; the message
+  names the replacement — type it into the (editable) model box.
+- **Ollama (Local): "Ollama is not running on this computer"** → start Ollama
+  (or `ollama serve`), confirm `ollama list` shows a model, and press the check
+  button again. This is never retried automatically.
+- **Ollama (Local): "none of its model(s) can analyse images"** → pull a model
+  that reads images, e.g. `ollama pull gemma4`.
+- **Ollama: "answered with no text" / "no complete JSON object"** → try a
+  larger image-capable model or fewer keywords; incomplete JSON is treated as
+  temporary and retried on its own.
+- **Ollama Cloud: 402 / "rejected your API key"** → the account has no plan or
+  credits for that model, or the key is wrong
+  (<https://ollama.com/settings/keys>).
 
-## Credits / license
+## Credits / licenses
 
-Real-ESRGAN is by Xintao Wang et al. (xinntao/Real-ESRGAN, BSD-3-Clause). This
-project reuses the public pretrained weights and re-implements the network for
-inference. Output is for personal use under the model's license terms.
+- Real-ESRGAN by Xintao Wang et al. (xinntao/Real-ESRGAN, BSD-3-Clause) — the
+  public x4plus weights; the network is re-implemented for inference.
+- Inter Tight by The Inter Project Authors — SIL Open Font License 1.1
+  (`app/assets/fonts/OFL.txt`).
+- Lucide icons — ISC License (`app/assets/icons/LICENSE-lucide.txt`).
+- PyTorch (BSD-style), PySide6/Qt (LGPLv3), Pillow (MIT-CMU), NumPy (BSD),
+  Django (BSD) — check each license before redistributing the packaged app.

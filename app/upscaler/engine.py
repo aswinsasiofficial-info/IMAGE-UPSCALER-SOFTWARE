@@ -18,13 +18,15 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from app import paths
+
 from .geometry import MODEL_SCALE
 
 WEIGHTS_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-WEIGHTS_FILE = "RealESRGAN_x4plus.pth"
+WEIGHTS_FILE = paths.WEIGHTS_FILE
 WEIGHTS_MIN_BYTES = 40 * 1024 * 1024    # the official file is ~64 MB; less means truncated
-# Shared download cache: the weights are data, so an existing download is reused.
-MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
+# models/ beside the app (or the user's data folder for a packaged app without weights).
+MODEL_DIR = paths.model_dir()
 TILE_PAD = 16       # context added around each tile so seams don't show
 MIN_TILE = 64
 

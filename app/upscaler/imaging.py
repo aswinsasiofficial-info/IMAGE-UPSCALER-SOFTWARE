@@ -1,8 +1,7 @@
 """Pixel handling for the Upscaler: probing, loading, composing and saving.
 
-Nothing here distorts an image. Resizes use the plan's single scale factor
-for both axes, padding only adds borders around the whole picture, and
-cropping only happens when the plan records that the user chose it.
+Nothing here distorts or crops an image: the network's 4× result is resized
+to the planned size with one factor for both axes, and saved whole.
 """
 
 from __future__ import annotations
@@ -15,15 +14,10 @@ from typing import Optional
 import numpy as np
 from PIL import Image, ImageOps
 
-from .geometry import CROP, PAD, Plan
+from .geometry import Plan
 
 EXIF_ORIENTATION = 0x0112
 _ROTATED_ORIENTATIONS = {5, 6, 7, 8}   # EXIF values that swap width and height
-PAD_COLORS = {
-    "white": (255, 255, 255, 255),
-    "black": (0, 0, 0, 255),
-    "transparent": (0, 0, 0, 0),
-}
 _ALPHA_MODES = {"RGBA", "LA", "PA", "RGBa", "La"}
 _HIGH_BIT_MODES = {"I", "I;16", "I;16B", "I;16L", "I;16N", "F"}
 
@@ -101,31 +95,16 @@ def load(path: Path) -> SourceImage:
         return SourceImage(np.array(rgb, dtype=np.uint8), alpha, _rgb_profile(icc))
 
 
-def compose(ai_rgb: np.ndarray, alpha: Optional[Image.Image], plan: Plan,
-            pad_color: str = "white") -> Image.Image:
-    """Turn the 4x network output into the planned final image."""
-    if not plan.resolved:
-        raise ValueError("this image needs an explicit Pad or Crop choice")
+def compose(ai_rgb: np.ndarray, alpha: Optional[Image.Image], plan: Plan) -> Image.Image:
+    """Turn the network's 4× output into the planned final image (whole picture)."""
     img = Image.fromarray(ai_rgb)       # (H, W, 3) uint8 -> "RGB"
     if alpha is not None:
         img.putalpha(alpha.resize(img.size, Image.Resampling.BICUBIC))
-    if img.size != plan.content:
-        # Same factor on both axes (from the plan); Pillow resizes RGBA premultiplied.
-        img = img.resize(plan.content, Image.Resampling.LANCZOS)
-    if plan.content == plan.output:
-        return img
-
-    ow, oh = plan.output
-    if plan.fit == CROP:
-        left, top = -plan.offset[0], -plan.offset[1]
-        return img.crop((left, top, left + ow, top + oh))
-    if plan.fit == PAD:
-        color = PAD_COLORS[pad_color]
-        mode = "RGBA" if img.mode == "RGBA" or color[3] < 255 else "RGB"
-        canvas = Image.new(mode, plan.output, color if mode == "RGBA" else color[:3])
-        canvas.paste(img.convert(mode), plan.offset)
-        return canvas
-    raise ValueError("plan has a different output size but no fit")
+    if img.size != plan.output:
+        # 1-3× reduce and 5× enlarge the 4× result with the same factor on both
+        # axes; Pillow resizes RGBA premultiplied, so edges stay clean.
+        img = img.resize(plan.output, Image.Resampling.LANCZOS)
+    return img
 
 
 def save(img: Image.Image, path: Path, output_format: str, jpg_quality: int = 95,
