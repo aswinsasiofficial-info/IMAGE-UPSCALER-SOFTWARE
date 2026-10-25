@@ -18,6 +18,13 @@ def main() -> int:
         print("Run:  .venv\\Scripts\\python -m pip install -r requirements.txt", file=sys.stderr)
         return 2
 
+    # Qt WebEngine (the Upscaler screen's embedded browser) has to be loaded
+    # before QApplication exists. Missing WebEngine is handled by that screen.
+    try:
+        from PySide6 import QtWebEngineWidgets  # noqa: F401
+    except ImportError:
+        pass
+
     from PySide6.QtWidgets import QApplication
 
     from app.ui.main_window import MainWindow

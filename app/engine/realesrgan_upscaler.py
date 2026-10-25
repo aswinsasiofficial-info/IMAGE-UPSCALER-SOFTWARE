@@ -57,6 +57,10 @@ class UpscaleSettings:
     jpg_quality: int = 95
     filename_suffix: str = "_x4"
     keep_original_name: bool = True
+    # When True, ignore original names and rename every output in the batch to
+    # <PREFIX><n>.<ext>, with one shared random 4-5 letter uppercase prefix and
+    # a sequential number starting at 1 (numbering restarts per output folder).
+    rename_batch: bool = False
     output_in_source_dir: bool = False  # True: write next to each source; False: use chosen folder
     # Exact saved output size (px). The 4x AI result is resized to *cover* this
     # box (aspect ratio kept, may enlarge) and center-cropped to exactly these
