@@ -1,7 +1,8 @@
 # Batch Image Upscaler (Real-ESRGAN x4plus) + Metadata Generator
 
-A local, GPU-accelerated desktop app for **batch-upscaling images 4×** with the
-**Real-ESRGAN `x4plus`** model, built on **PyTorch + CUDA** — plus a separate
+A local, GPU-accelerated desktop app for **batch-upscaling images** (4× by
+default) with the **Real-ESRGAN `x4plus`** model, built on **PyTorch + CUDA** —
+every image keeps its own aspect ratio and its whole picture — plus a separate
 **Metadata Generator** screen that writes Adobe Stock–ready titles, descriptions
 and keywords with **Gemini**, **Groq** or **Ollama** (your own local server *or*
 Ollama's hosted cloud).
@@ -28,13 +29,27 @@ Ollama keeps even those on your computer); the two features are independent
 - **VRAM-safe tiling** — large images are automatically split into overlapping
   tiles so they fit in 6 GB of VRAM (no out-of-memory crashes on big photos).
 - **RGBA / transparency preserved** — alpha channels are upscaled cleanly.
-- **Exact output size (crop-to-fill)** — every saved image is *exactly* the
-  configured target (default **8000 × 5000 px**): the 4× result is resized
-  (high-quality Lanczos, uniform scale — never stretched) to cover the target,
-  then center-cropped; smaller 4× results are enlarged to fill. `0` disables.
+- **Shape always preserved** — width and height are multiplied by the *same*
+  factor (default **4×**; 1–8× allowed), so nothing is ever cropped, stretched,
+  zoomed or distorted by default. A 1024 × 1536 portrait at 4× becomes exactly
+  4096 × 6144; a 1536 × 1024 landscape becomes 6144 × 4096.
+- **Output sizes shown before processing** — every queued image lists its
+  original size and shape and the exact pixel size it will be saved at, with a
+  small diagram of the result for the selected image.
+- **Optional exact size, never silent** — if you type a fixed W × H and an
+  image has a different shape, the app says so (how many images, by how much)
+  and refuses to start until you explicitly pick **Pad to fit** (whole picture
+  kept, borders in white/black/transparent) or **Crop to fill** (frame filled,
+  edges trimmed — the exact pixels lost are shown). There is no stretch option.
 - **PNG or JPEG output**, custom output folder (or save beside originals),
-  configurable suffix, live progress bar, per-image logging and cancel.
+  configurable suffix, optional batch rename, live progress bar, per-image
+  logging and cancel. Embedded RGB colour profiles (e.g. Display P3) are kept.
 - **Drag & drop** or browse to add images.
+- **Django-based Upscaler screen** — the Upscaler is a Django app served by a
+  private local server inside the desktop app (127.0.0.1 only, fresh access
+  token each launch) and shown in the window with Qt WebEngine, using the
+  app's own palette. Native file dialogs and message boxes still come from the
+  desktop app.
 
 ### Metadata Generator (separate screen, top-nav **Metadata**)
 
@@ -101,7 +116,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
 This creates a `.venv`, installs the **CUDA 12.6** build of PyTorch, PySide6,
-Pillow and NumPy, then prints whether CUDA is detected. If it says
+Pillow, NumPy and Django, then prints whether CUDA is detected. If it says
 `CUDA available: True`, you're good.
 
 <details>
@@ -111,7 +126,7 @@ Pillow and NumPy, then prints whether CUDA is detected. If it says
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-.\.venv\Scripts\python.exe -m pip install PySide6 Pillow numpy
+.\.venv\Scripts\python.exe -m pip install PySide6 Pillow numpy "Django>=5.2"
 .\.venv\Scripts\python.exe -m pip install google-genai requests keyring  # optional: Metadata screen
 ```
 </details>
@@ -131,11 +146,15 @@ Then:
    brought in via **Add Folder…** always go to `<folder>/upscaled/` instead,
    keeping each image's relative subfolder path (this takes precedence for
    those files).
-3. Choose **Device** (CUDA), keep **fp16** on, a **tile size** (256 is the
-   recommended default for a 6 GB GPU; `0` = no tiling), and the **exact target
-   size** (default 8000 × 5000 — every output is resized to cover it and then
-   center-cropped to exactly that size; `0` disables crop-to-fill).
-4. Click **Start Upscaling**. Watch the progress bar and log; **Cancel** anytime.
+3. Choose **Device** (CUDA), keep **fp16** on, and a **tile size** (256 is the
+   recommended default for a 6 GB GPU; `0` = no tiling).
+4. Under **Output size**, keep **Scale by 4×** (or pick another factor) — the
+   queue shows every image's output size, e.g. `1024 × 1536 → 4096 × 6144`.
+   Choose **Exact size** only if you need a fixed W × H: images whose shape
+   differs are flagged, and you must pick **Pad to fit** or **Crop to fill**
+   before the batch can start (**Match selected image's shape** sets a height
+   that needs neither).
+5. Click **Start Upscaling**. Watch the progress bar and log; **Cancel** anytime.
 
 On the very first run the app downloads `RealESRGAN_x4plus.pth` into `models/`
 and shows download progress in the status bar.
@@ -172,12 +191,13 @@ and shows download progress in the status bar.
 
 | Concern | Approach |
 |---|---|
-| Model | Self-contained `RRDBNet` re-implementation (identical architecture & weights to the official `RealESRGAN_x4plus.pth`), so we avoid the `basicsr`/`realesrgan` packages that break on modern torchvision. |
+| UI | Django app (`app/upscaler`) on a private local server (`app/web`), shown in the window by Qt WebEngine (`app/ui/upscaler_web_page.py`). The queue, size plan and batch live server-side, so the previewed sizes come from the same code that writes the files. |
+| Model | Self-contained `RRDBNet` (`app/upscaler/network.py`, identical architecture to the official `RealESRGAN_x4plus.pth`), so we avoid the `basicsr`/`realesrgan` packages that break on modern torchvision. |
 | Batching | One model load for the whole queue; images are processed back-to-back on the GPU. |
-| VRAM | Tile-based inference with an overlap pad (`tile=256`, `pad=16`) bounds peak memory for arbitrarily large inputs. |
+| VRAM | Tile-based inference with an overlap pad (`tile=256`, `pad=16`) bounds peak memory; results go straight into an 8-bit canvas, and a CUDA out-of-memory error halves the tile and retries. |
 | Speed | `torch.inference_mode` + fp16 + cuDNN on the RTX 3050. |
 | Transparency | RGB is upscaled by the network; the alpha channel is resized with bicubic and recombined. |
-| Output size | After 4× inference the composited image is resized with Lanczos to *cover* the configurable target (default 8000 × 5000) at a uniform scale — never stretched — then center-cropped to exactly that size. |
+| Output size | `app/upscaler/geometry.py` plans every image: the model always gives exactly 4×; any other factor is one Lanczos resize with the same factor on both axes. Exact sizes either match the image's shape, or use the pad/crop the user explicitly picked. Each saved file is re-opened to confirm it has the planned size. |
 
 ### Tuning for your GPU
 
@@ -191,29 +211,39 @@ and shows download progress in the status bar.
 ## Verify the engine (optional, no GUI)
 
 ```powershell
-.\.venv\Scripts\python.exe -m tests.smoke_test
+.\.venv\Scripts\python.exe -m tests.upscaler_test
 ```
 
-Generates a few test images, runs a real 4× batch and asserts the outputs are
-exactly 4× with the correct color mode (crop-to-fill is disabled for this test).
+The Upscaler without the model (a pixel-exact 4× stand-in replaces the
+network): size planning for portrait/landscape/odd shapes and factors, the
+settings form (pad/crop required on a shape conflict, no stretch), the Django
+API with its launch token, CSRF and host checks, and full batches that write
+real files — each output's size and aspect ratio are checked, and shrinking it
+back must reproduce the source with the corner markers in the right corners
+(nothing cropped or shifted). Also folder mode, no-overwrite, batch rename,
+alpha, colour profiles, cancel, and that none of it uses the old upscaler.
 
 ```powershell
-.\.venv\Scripts\python.exe -m tests.target_size_test
+.\.venv\Scripts\python.exe -m tests.upscaler_model_test            # add --example for 1024×1536 → 4096×6144
 ```
 
-Checks the exact-target-size behaviour: cover/aspect math, every output landing
-on exactly the target dimensions (including enlarging small sources), centered-crop
-correctness, and that a PNG with transparency keeps its alpha after crop-to-fill
-(no GPU/model required).
+Runs portrait, landscape, EXIF-rotated and transparent images through the real
+Real-ESRGAN network (downloads the weights once), at 4×, 2× and an exact size
+with pad and crop, and checks every result lines up with its source.
 
 ```powershell
-.\.venv\Scripts\python.exe -m tests.folder_mode_test
+.\.venv\Scripts\python.exe -m tests.upscaler_desktop_test
 ```
 
-Verifies the folder-mode path logic without running the model: recursive scanning,
-exclusion of the `upscaled` output folder, structure-preserving output paths
-(`<folder>/upscaled/<sub>/<name>_x4.<ext>`), fallback to the classic output modes,
-and collision handling.
+Builds the real window offscreen: both screens present, the local server only
+starts when the Upscaler is shown, native dialogs requested by the page open on
+the GUI thread, Explorer drops reach the queue, and — where Qt WebEngine can
+render offscreen — Start is clicked in the actual page (blocked on a shape
+conflict until Pad is chosen) and the files are checked.
+
+`tests.smoke_test`, `tests.target_size_test`, `tests.worker_batch_test`,
+`tests.folder_mode_test` and `tests.batch_rename_test` exercise the previous
+upscaler implementation, which the app no longer uses (see *Project layout*).
 
 ```powershell
 .\.venv\Scripts\python.exe -m tests.metadata_test
@@ -245,27 +275,47 @@ whole folder batch succeeds.
 ```
 app/
   main.py                     # GUI entry point (python -m app.main)
+  upscaler/                   # the Upscaler — a Django app
+    geometry.py               # output-size planning: scale / exact + pad/crop
+    imaging.py                # EXIF-aware load, compose (resize/pad/crop), save
+    network.py                # Real-ESRGAN x4plus network (RRDBNet)
+    engine.py                 # weights, device, tiled inference, OOM fallback
+    files.py                  # folder scan, folder mode, naming, no-overwrite
+    workspace.py              # queue + background batch (progress, log, cancel)
+    forms.py                  # settings validation (pad/crop rule)
+    views.py · urls.py        # page + JSON API
+    host.py                   # hooks the desktop lends it (dialogs, palette)
+    templates/ · static/      # the page (HTML, CSS, JS)
+  web/                        # Django project for the embedded server
+    settings.py · urls.py
+    middleware.py             # per-launch access token
+    server.py                 # 127.0.0.1 server in a background thread
   engine/
-    rrdbnet.py                # Real-ESRGAN x4plus network architecture
-    realesrgan_upscaler.py    # weights, tiled inference, image I/O
-    worker.py                 # QThread batch runner (progress + cancel)
     metadata_settings.py      # metadata dataclasses, limits, JSON parsing
     metadata_providers.py     # Gemini/Groq/Ollama calls with retry + backoff
     metadata_worker.py        # QThread metadata batch + Ollama lookup runners
     metadata_export.py        # contributor CSV writer + PNG/JPEG embedder
     credential_store.py       # API keys: session → env → Windows keyring
+    worker.py                 # previous upscaler's batch runner; the Metadata
+                              #   screen still imports its image-folder scanner
+    realesrgan_upscaler.py    # previous upscaler (not used by the app any more)
+    rrdbnet.py                # previous upscaler (not used by the app any more)
   ui/
     main_window.py            # shell: top navigation + stacked feature pages
-    upscale_page.py           # the original upscaler screen
+    upscaler_web_page.py      # Upscaler screen: embeds the Django page
+    upscale_page.py           # previous upscaler screen (not used any more)
     metadata_page.py          # Metadata Generator screen
     metadata_review.py        # final review table + export options
 tests/
-  smoke_test.py               # headless end-to-end check
-  target_size_test.py         # exact-target crop-to-fill + transparency check
-  folder_mode_test.py         # folder-mode scanning/output-path check
+  upscaler_test.py            # Upscaler: planning, form, API, batches (no model)
+  upscaler_model_test.py      # Upscaler with the real Real-ESRGAN network
+  upscaler_desktop_test.py    # Upscaler inside the real window (offscreen)
   metadata_test.py            # metadata engine/worker/UI checks (no network)
   ollama_test.py              # Ollama local + cloud provider/worker/UI checks
+  smoke_test.py · target_size_test.py · worker_batch_test.py ·
+  folder_mode_test.py · batch_rename_test.py   # previous upscaler
 models/                       # downloaded weights (auto-created)
+manage.py                     # Django checks / standalone dev server
 setup.ps1 · run.bat · run.ps1 · requirements.txt
 ```
 
@@ -273,7 +323,15 @@ setup.ps1 · run.bat · run.ps1 · requirements.txt
 
 - **`CUDA available: False`** → update your NVIDIA driver, or the installed
   torch is the CPU build. Reinstall with the `cu126` index command above.
-- **Out of memory** → reduce **Tile size**, keep **fp16** enabled.
+- **Out of memory** → the Upscaler halves the tile size and retries on its own;
+  if it still fails, reduce **Tile size**, keep **fp16** enabled.
+- **Upscaler screen says the embedded browser isn't available** → Qt WebEngine
+  is missing (e.g. only `PySide6-Essentials` installed). Reinstall the full
+  `PySide6` package, or use the **Open Upscaler in Browser** button meanwhile —
+  it is the same local page, and file dialogs still open from the app.
+- **"Choose Pad or Crop" when starting** → you set an **Exact size** whose
+  shape differs from some images. Pick how to handle them, switch back to
+  **Scale by**, or press **Match selected image's shape**.
 - **App won't launch** → ensure you ran `setup.ps1`; run `run.bat` from this
   folder. Check the console output for the Python error.
 - **Weights download blocked** → manually place `RealESRGAN_x4plus.pth` from the

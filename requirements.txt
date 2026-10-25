@@ -7,9 +7,14 @@
 
 torch==2.14.1+cu126
 torchvision==0.29.1+cu126
+# The PySide6 package includes Qt WebEngine, which shows the Upscaler screen.
 PySide6>=6.8
 Pillow>=10.0
 numpy>=1.26
+
+# Upscaler screen: a Django app served by a private local server inside the
+# desktop app (127.0.0.1 only). 5.2 LTS on Python 3.10/3.11, newer on 3.12+.
+Django>=5.2
 
 # Metadata Generator (optional — only needed for the Metadata screen).
 # Gemini uses the official SDK; Groq and both Ollama modes (local server at
